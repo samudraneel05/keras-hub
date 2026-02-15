@@ -566,6 +566,24 @@ from keras_hub.src.models.qwen3_moe.qwen3_moe_causal_lm import (
 from keras_hub.src.models.qwen3_moe.qwen3_moe_causal_lm_preprocessor import (
     Qwen3MoeCausalLMPreprocessor as Qwen3MoeCausalLMPreprocessor,
 )
+from keras_hub.src.models.qwen_image.qwen_image_backbone import (
+    QwenImageBackbone as QwenImageBackbone,
+)
+from keras_hub.src.models.qwen_image.qwen_image_text_to_image import (
+    QwenImageTextToImage as QwenImageTextToImage,
+)
+from keras_hub.src.models.qwen_image.qwen_image_text_to_image_preprocessor import (
+    QwenImageTextToImagePreprocessor as QwenImageTextToImagePreprocessor,
+)
+from keras_hub.src.models.qwen_image_edit.qwen_image_edit_backbone import (
+    QwenImageEditBackbone as QwenImageEditBackbone,
+)
+from keras_hub.src.models.qwen_image_edit.qwen_image_edit_image_to_image import (
+    QwenImageEditImageToImage as QwenImageEditImageToImage,
+)
+from keras_hub.src.models.qwen_image_edit.qwen_image_edit_image_to_image_preprocessor import (
+    QwenImageEditImageToImagePreprocessor as QwenImageEditImageToImagePreprocessor,
+)
 from keras_hub.src.models.qwen_moe.qwen_moe_backbone import (
     QwenMoeBackbone as QwenMoeBackbone,
 )
