@@ -96,6 +96,11 @@ class TransformerDecoder(keras.layers.Layer):
         kernel_initializer="glorot_uniform",
         bias_initializer="zeros",
         normalize_first=False,
+        kv_budget=None,
+        eviction_policy=None,
+        snapkv_window_size=32,
+        snapkv_kernel_size=5,
+        streaming_llm_n_sink=4,
         **kwargs,
     ):
         # Work around for model saving, we need to ensure our model is built
@@ -115,6 +120,12 @@ class TransformerDecoder(keras.layers.Layer):
         self.supports_masking = True
         self._decoder_sequence_shape = None
         self._encoder_sequence_shape = None
+        # KV compression args (forwarded to self-attention layer).
+        self.kv_budget = kv_budget
+        self.eviction_policy = eviction_policy
+        self.snapkv_window_size = snapkv_window_size
+        self.snapkv_kernel_size = snapkv_kernel_size
+        self.streaming_llm_n_sink = streaming_llm_n_sink
 
         if decoder_sequence_shape:
             self.build(decoder_sequence_shape, encoder_sequence_shape)
@@ -146,6 +157,11 @@ class TransformerDecoder(keras.layers.Layer):
             bias_initializer=clone_initializer(self.bias_initializer),
             dtype=self.dtype_policy,
             name="self_attention",
+            kv_budget=self.kv_budget,
+            eviction_policy=self.eviction_policy,
+            snapkv_window_size=self.snapkv_window_size,
+            snapkv_kernel_size=self.snapkv_kernel_size,
+            streaming_llm_n_sink=self.streaming_llm_n_sink,
         )
         if hasattr(self._self_attention_layer, "_build_from_signature"):
             self._self_attention_layer._build_from_signature(
@@ -251,6 +267,7 @@ class TransformerDecoder(keras.layers.Layer):
         cross_attention_cache=None,
         cross_attention_cache_update_index=None,
         use_causal_mask=True,
+        self_attention_eviction_mask=None,
         training=None,
     ):
         """Forward pass of the TransformerDecoder.
@@ -361,10 +378,15 @@ class TransformerDecoder(keras.layers.Layer):
             attention_mask=self_attention_mask,
             cache=self_attention_cache,
             cache_update_index=self_attention_cache_update_index,
+            attention_eviction_mask=self_attention_eviction_mask,
             training=training,
         )
+        eviction_mask_out = None
         if self_attention_cache is None:
             x = attention_output
+        elif isinstance(attention_output, tuple) and len(attention_output) == 3:
+            # Pre-fill returned (output, cache, eviction_mask)
+            x, self_attention_cache, eviction_mask_out = attention_output
         else:
             x, self_attention_cache = attention_output
         x = self._self_attention_dropout(x, training=training)
@@ -413,8 +435,17 @@ class TransformerDecoder(keras.layers.Layer):
 
         if self_attention_cache is not None:
             if has_cross_attention:
+                if eviction_mask_out is not None:
+                    return (
+                        x,
+                        self_attention_cache,
+                        cross_attention_cache,
+                        eviction_mask_out,
+                    )
                 return (x, self_attention_cache, cross_attention_cache)
             else:
+                if eviction_mask_out is not None:
+                    return (x, self_attention_cache, eviction_mask_out)
                 return (x, self_attention_cache)
         else:
             return x
@@ -476,6 +507,11 @@ class TransformerDecoder(keras.layers.Layer):
                 "normalize_first": self.normalize_first,
                 "decoder_sequence_shape": self._decoder_sequence_shape,
                 "encoder_sequence_shape": self._encoder_sequence_shape,
+                "kv_budget": self.kv_budget,
+                "eviction_policy": self.eviction_policy,
+                "snapkv_window_size": self.snapkv_window_size,
+                "snapkv_kernel_size": self.snapkv_kernel_size,
+                "streaming_llm_n_sink": self.streaming_llm_n_sink,
             }
         )
         return config

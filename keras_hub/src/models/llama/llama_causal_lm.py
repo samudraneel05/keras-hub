@@ -53,11 +53,24 @@ class LlamaCausalLM(CausalLM):
             **kwargs,
         )
 
+    def _has_kv_eviction(self):
+        """Return True if any transformer layer has an eviction policy set."""
+        return any(
+            getattr(
+                getattr(layer, "_self_attention_layer", None),
+                "eviction_policy",
+                None,
+            )
+            is not None
+            for layer in self.backbone.transformer_layers
+        )
+
     def call_with_cache(
         self,
         token_ids,
         cache,
         cache_update_index,
+        eviction_masks=None,
     ):
         """Forward pass of `LlamaCausalLM` with cache.
 
@@ -71,27 +84,51 @@ class LlamaCausalLM(CausalLM):
             cache: a dense float Tensor, the cache of key and value.
             cache_update_index: int, or int Tensor. The index of current inputs
             in the whole sequence.
+            eviction_masks: optional list of per-layer boolean Tensors of shape
+                `[batch_size, seq_len]`. When provided, each mask restricts
+                attention to non-evicted positions for that layer. Only used
+                when KV cache compression is active. Passing `None` preserves
+                the original three-element return signature.
 
         Returns:
-            A (logits, hidden_states, cache) tuple. Where `logits` is the
-            language model logits for the input token_ids, `hidden_states` is
-            the final hidden representation of the input tokens, and `cache` is
-            the decoding cache.
+            When KV cache compression is **not** active (default / backward-
+            compatible behaviour): a `(logits, hidden_states, cache)` tuple.
+
+            When KV cache compression **is** active (i.e. at least one layer
+            has `eviction_policy` set): a
+            `(logits, hidden_states, cache, eviction_masks)` tuple, where
+            `eviction_masks` is a per-layer list of boolean `[B, S]` Tensors.
         """
         x = self.backbone.token_embedding(token_ids)
-        # Each decoder layer has a cache; we update them separately.
         updated_cache = []
+        new_eviction_masks = []
         for i in range(self.backbone.num_layers):
             current_cache = cache[:, i, ...]
-            x, next_cache = self.backbone.transformer_layers[i](
+            layer_eviction_mask = (
+                eviction_masks[i] if eviction_masks is not None else None
+            )
+            result = self.backbone.transformer_layers[i](
                 x,
                 self_attention_cache=current_cache,
                 self_attention_cache_update_index=cache_update_index,
+                self_attention_eviction_mask=layer_eviction_mask,
             )
+            # result may be (x, cache) or (x, cache, eviction_mask)
+            if len(result) == 3:
+                x, next_cache, layer_mask = result
+                new_eviction_masks.append(layer_mask)
+            else:
+                x, next_cache = result
+                new_eviction_masks.append(layer_eviction_mask)
             updated_cache.append(next_cache)
         cache = ops.stack(updated_cache, axis=1)
         hidden_states = x = self.backbone.layer_norm(x)
         logits = self.backbone.token_embedding(x, reverse=True)
+        # Only extend the return tuple when eviction is active, so existing
+        # callers that do `logits, hs, cache = call_with_cache(...)` continue
+        # to work without modification.
+        if self._has_kv_eviction():
+            return logits, hidden_states, cache, new_eviction_masks
         return logits, hidden_states, cache
 
     def _build_cache(self, token_ids):
@@ -110,8 +147,14 @@ class LlamaCausalLM(CausalLM):
             head_dim,
         ]
         cache = ops.zeros(shape, dtype=self.compute_dtype)
-        # Seed the cache.
-        _, hidden_states, cache = self.call_with_cache(token_ids, cache, 0)
+        # Seed the cache; capture eviction masks if compression is active.
+        result = self.call_with_cache(token_ids, cache, 0)
+        if self._has_kv_eviction():
+            # call_with_cache returned (logits, hidden_states, cache, masks)
+            _, hidden_states, cache, eviction_masks = result
+            return hidden_states, cache, eviction_masks
+        # Backward-compatible path: return original 2-tuple.
+        _, hidden_states, cache = result
         return hidden_states, cache
 
     def generate_step(
@@ -134,7 +177,14 @@ class LlamaCausalLM(CausalLM):
         """
         token_ids, padding_mask = inputs["token_ids"], inputs["padding_mask"]
         # Create and seed cache with a single forward pass.
-        hidden_states, cache = self._build_cache(token_ids)
+        build_result = self._build_cache(token_ids)
+        if len(build_result) == 3:
+            # KV compression active: got (hidden_states, cache, eviction_masks)
+            hidden_states, cache, eviction_masks = build_result
+        else:
+            # Original path: (hidden_states, cache)
+            hidden_states, cache = build_result
+            eviction_masks = None
         # Compute the lengths of all user inputted tokens ids.
         row_lengths = ops.sum(ops.cast(padding_mask, "int32"), axis=-1)
         # Start at the first index that has no user inputted id.
@@ -145,11 +195,16 @@ class LlamaCausalLM(CausalLM):
             cache_update_index = index - 1
             batch_size = ops.shape(prompt)[0]
             prompt = ops.slice(prompt, [0, cache_update_index], [batch_size, 1])
-            logits, hidden_states, cache = self.call_with_cache(
+            result = self.call_with_cache(
                 prompt,
                 cache,
                 cache_update_index,
+                eviction_masks=eviction_masks,
             )
+            if len(result) == 4:
+                logits, hidden_states, cache, _ = result
+            else:
+                logits, hidden_states, cache = result
             return (
                 ops.squeeze(logits, axis=1),
                 ops.squeeze(hidden_states, axis=1),
