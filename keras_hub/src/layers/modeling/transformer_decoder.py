@@ -268,6 +268,7 @@ class TransformerDecoder(keras.layers.Layer):
         cross_attention_cache_update_index=None,
         use_causal_mask=True,
         self_attention_eviction_mask=None,
+        return_eviction_mask=False,
         training=None,
     ):
         """Forward pass of the TransformerDecoder.
@@ -307,15 +308,24 @@ class TransformerDecoder(keras.layers.Layer):
                 (masking out future input) is applied `on the decoder sequence.
             training: a boolean indicating whether the layer should behave in
                 training mode or in inference mode.
+            return_eviction_mask: bool, defaults to `False`. When `True` and a
+                KV eviction policy is active on the self-attention layer, an
+                eviction mask Tensor of shape `[batch_size, seq_len]` is
+                appended to the return tuple. Set to `True` only if the caller
+                knows how to handle the extra element (e.g. `LlamaCausalLM`).
+                All other callers should leave this as `False` (default) so
+                that the original return arity is preserved.
 
         Returns:
             One of three things, depending on call arguments:
-            - `outputs`, if `self_attention_cache` is `None.
+            - `outputs`, if `self_attention_cache` is `None`.
             - `(outputs, self_attention_cache)`, if `self_attention_cache` is
               set and the layer has no cross-attention.
             - `(outputs, self_attention_cache, cross_attention_cache)`, if
               `self_attention_cache` and `cross_attention_cache` are set and
               the layer has cross-attention.
+            When `return_eviction_mask=True` **and** eviction was actually
+            triggered, the eviction mask Tensor is appended to the tuple.
         """
 
         has_encoder_sequence = encoder_sequence is not None
@@ -435,7 +445,7 @@ class TransformerDecoder(keras.layers.Layer):
 
         if self_attention_cache is not None:
             if has_cross_attention:
-                if eviction_mask_out is not None:
+                if return_eviction_mask and eviction_mask_out is not None:
                     return (
                         x,
                         self_attention_cache,
@@ -444,7 +454,7 @@ class TransformerDecoder(keras.layers.Layer):
                     )
                 return (x, self_attention_cache, cross_attention_cache)
             else:
-                if eviction_mask_out is not None:
+                if return_eviction_mask and eviction_mask_out is not None:
                     return (x, self_attention_cache, eviction_mask_out)
                 return (x, self_attention_cache)
         else:

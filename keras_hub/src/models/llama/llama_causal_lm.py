@@ -102,6 +102,7 @@ class LlamaCausalLM(CausalLM):
         x = self.backbone.token_embedding(token_ids)
         updated_cache = []
         new_eviction_masks = []
+        _return_mask = self._has_kv_eviction()
         for i in range(self.backbone.num_layers):
             current_cache = cache[:, i, ...]
             layer_eviction_mask = (
@@ -112,9 +113,11 @@ class LlamaCausalLM(CausalLM):
                 self_attention_cache=current_cache,
                 self_attention_cache_update_index=cache_update_index,
                 self_attention_eviction_mask=layer_eviction_mask,
+                return_eviction_mask=_return_mask,
             )
-            # result may be (x, cache) or (x, cache, eviction_mask)
-            if len(result) == 3:
+            # result is (x, cache) normally; (x, cache, eviction_mask)
+            # only when return_eviction_mask=True and eviction fired.
+            if _return_mask and len(result) == 3:
                 x, next_cache, layer_mask = result
                 new_eviction_masks.append(layer_mask)
             else:
