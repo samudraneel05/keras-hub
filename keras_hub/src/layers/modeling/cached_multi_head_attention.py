@@ -223,10 +223,13 @@ class CachedMultiHeadAttention(keras.layers.MultiHeadAttention):
                 pooled = ops.mean(ops.stack(pooled_parts, axis=-1), axis=-1)
                 scores = ops.reshape(pooled, [bsz, n_heads, s_main])
 
-                # Pad window positions back with max score so they're kept
+                # Pad window positions back with max score so they're kept.
+                # ops.full() rejects a tensor fill_value on PyTorch backend;
+                # use ops.ones * scalar instead (works on all backends).
                 max_score = ops.max(scores) + 1.0
-                window_scores = ops.full(
-                    [bsz, n_heads, window], max_score, dtype=scores.dtype
+                window_scores = (
+                    ops.ones([bsz, n_heads, window], dtype=scores.dtype)
+                    * max_score
                 )
                 joint = ops.concatenate(
                     [scores, window_scores], axis=-1
