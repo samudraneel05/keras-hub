@@ -95,6 +95,18 @@ def compute_hf_references(hf_model, hf_tokenizer, run_generate_check):
         f"  absmax={log_f.abs().max():.6f}"
     )
 
+    # Consistency check: do hidden states
+    # match what the thinker actually computes
+    with torch.no_grad():
+        diag_logits = hf_model.lm_head(hf_hidden)
+        diag_vs_full = (
+            (diag_logits.float() - hf_outputs.logits.float()).abs().max()
+        )
+    print(
+        f"[DIAG-HF] lm_head(diag_hidden) vs thinker logits"
+        f" max diff: {diag_vs_full:.8f}"
+    )
+
     references = {
         "params": hf_model.num_parameters(),
         "token_ids": input_ids.detach().cpu().numpy(),
