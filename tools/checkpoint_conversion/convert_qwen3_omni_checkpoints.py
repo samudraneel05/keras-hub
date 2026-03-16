@@ -15,7 +15,12 @@ device = torch.device("cpu")
 # Force PyTorch to use CPU
 torch.set_default_device(device)
 
+import keras  # noqa: E402
 from keras import ops  # noqa: E402
+
+# Disable fused/flash attention so Keras uses the manual einsum
+if hasattr(keras.config, "disable_flash_attention"):
+    keras.config.disable_flash_attention()
 from transformers import AutoModelForMultimodalLM  # noqa: E402
 from transformers import AutoTokenizer  # noqa: E402
 
@@ -186,6 +191,7 @@ def test_model(keras_hub_model, keras_hub_tokenizer, hf_references):
         keras_hub_output, reverse=True
     )
     keras_hub_logits = ops.convert_to_numpy(keras_hub_logits)
+    keras_hub_logits = np.array(keras_hub_logits, dtype=np.float32)
     logit_diff = np.abs(keras_hub_logits - hf_references["logits"]).max()
     logit_match = np.count_nonzero(
         np.abs(keras_hub_logits - hf_references["logits"]) > 1e-3
@@ -194,9 +200,10 @@ def test_model(keras_hub_model, keras_hub_tokenizer, hf_references):
     hf_logit_size = hf_references["logits"].size
     print(f"[DIAG] Logits mismatched (>1e-3): {logit_match}/{hf_logit_size}")
     print(
-        f"[DIAG] Keras logits: mean={keras_hub_logits.mean():.6f}"
-        f"  std={keras_hub_logits.std():.6f}"
-        f"  absmax={np.abs(keras_hub_logits).max():.6f}"
+        f"[DIAG] Keras logits:"
+        f" mean={float(keras_hub_logits.mean()):.6f}"
+        f"  std={float(keras_hub_logits.std()):.6f}"
+        f"  absmax={float(np.abs(keras_hub_logits).max()):.6f}"
     )
 
     # High tolerance since bfloat16 is used as the default dtype for Qwen
