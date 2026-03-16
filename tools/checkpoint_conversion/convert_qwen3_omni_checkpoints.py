@@ -59,10 +59,43 @@ def compute_hf_references(hf_model, hf_tokenizer, run_generate_check):
     length = 32
     hf_inputs = hf_tokenizer([input_str], return_tensors="pt").to(device)
     hf_outputs = hf_model(**hf_inputs)
+
+    # --- Diagnostic: save intermediate values ---
+    input_ids = hf_inputs["input_ids"]
+    with torch.no_grad():
+        hf_embeddings = hf_model.model.embed_tokens(input_ids)
+        hf_text_out = hf_model.model(
+            input_ids=None,
+            attention_mask=hf_inputs.get("attention_mask"),
+            inputs_embeds=hf_embeddings,
+        )
+        hf_hidden = hf_text_out.last_hidden_state
+    print(f"\n[DIAG-HF] input_ids shape: {input_ids.shape}")
+    emb_f = hf_embeddings.float()
+    hid_f = hf_hidden.float()
+    log_f = hf_outputs.logits.float()
+    print(
+        f"[DIAG-HF] embeddings: mean={emb_f.mean():.6f}"
+        f"  std={emb_f.std():.6f}"
+        f"  absmax={emb_f.abs().max():.6f}"
+    )
+    print(
+        f"[DIAG-HF] hidden(post-norm): mean={hid_f.mean():.6f}"
+        f"  std={hid_f.std():.6f}"
+        f"  absmax={hid_f.abs().max():.6f}"
+    )
+    print(
+        f"[DIAG-HF] logits: mean={log_f.mean():.6f}"
+        f"  std={log_f.std():.6f}"
+        f"  absmax={log_f.abs().max():.6f}"
+    )
+
     references = {
         "params": hf_model.num_parameters(),
-        "token_ids": hf_inputs["input_ids"].detach().cpu().numpy(),
+        "token_ids": input_ids.detach().cpu().numpy(),
         "logits": hf_outputs.logits.detach().cpu().float().numpy(),
+        "embeddings": hf_embeddings.detach().cpu().float().numpy(),
+        "hidden_states": hf_hidden.detach().cpu().float().numpy(),
     }
 
     if run_generate_check:
@@ -117,11 +150,54 @@ def test_model(keras_hub_model, keras_hub_tokenizer, hf_references):
         ["What is Keras?"], sequence_length=5
     )[0]
 
+    # --- Diagnostic: compare at each stage ---
+    token_ids_tensor = keras_hub_inputs["token_ids"]
+    keras_embeddings = keras_hub_model.token_embedding(token_ids_tensor)
+    keras_embeddings_np = ops.convert_to_numpy(
+        ops.cast(keras_embeddings, "float32")
+    )
+    hf_emb = hf_references["embeddings"]
+    emb_diff = np.abs(keras_embeddings_np - hf_emb).max()
+    emb_match = np.count_nonzero(np.abs(keras_embeddings_np - hf_emb) > 1e-4)
+    print(f"\n[DIAG] Embedding max diff: {emb_diff:.8f}")
+    print(f"[DIAG] Embedding mismatched (>1e-4): {emb_match}/{hf_emb.size}")
+    print(
+        f"[DIAG] Keras emb: mean={keras_embeddings_np.mean():.6f}"
+        f"  std={keras_embeddings_np.std():.6f}"
+        f"  absmax={np.abs(keras_embeddings_np).max():.6f}"
+    )
+
     keras_hub_output = keras_hub_model(keras_hub_inputs)
+    keras_hidden_np = ops.convert_to_numpy(
+        ops.cast(keras_hub_output, "float32")
+    )
+    hf_hid = hf_references["hidden_states"]
+    hid_diff = np.abs(keras_hidden_np - hf_hid).max()
+    hid_match = np.count_nonzero(np.abs(keras_hidden_np - hf_hid) > 1e-3)
+    print(f"\n[DIAG] Hidden-state max diff: {hid_diff:.8f}")
+    print(f"[DIAG] Hidden-state mismatched (>1e-3): {hid_match}/{hf_hid.size}")
+    print(
+        f"[DIAG] Keras hidden: mean={keras_hidden_np.mean():.6f}"
+        f"  std={keras_hidden_np.std():.6f}"
+        f"  absmax={np.abs(keras_hidden_np).max():.6f}"
+    )
+
     keras_hub_logits = keras_hub_model.token_embedding(
         keras_hub_output, reverse=True
     )
     keras_hub_logits = ops.convert_to_numpy(keras_hub_logits)
+    logit_diff = np.abs(keras_hub_logits - hf_references["logits"]).max()
+    logit_match = np.count_nonzero(
+        np.abs(keras_hub_logits - hf_references["logits"]) > 1e-3
+    )
+    print(f"\n[DIAG] Logits max diff: {logit_diff:.8f}")
+    hf_logit_size = hf_references["logits"].size
+    print(f"[DIAG] Logits mismatched (>1e-3): {logit_match}/{hf_logit_size}")
+    print(
+        f"[DIAG] Keras logits: mean={keras_hub_logits.mean():.6f}"
+        f"  std={keras_hub_logits.std():.6f}"
+        f"  absmax={np.abs(keras_hub_logits).max():.6f}"
+    )
 
     # High tolerance since bfloat16 is used as the default dtype for Qwen
 
