@@ -143,7 +143,9 @@ def precompute_hf_outputs(
     model can be freed before loading KerasHub.
     """
     results = {}
-    results["hf_param_count"] = hf_thinker.num_parameters()
+    results["hf_param_count"] = sum(
+        {p.data_ptr(): p.numel() for p in hf_thinker.parameters()}.values()
+    )
 
     # --- Text-only ---
     hf_ids = hf_tokenizer(TEXT_PROMPT, return_tensors="np")["input_ids"]
@@ -220,14 +222,18 @@ def precompute_hf_outputs(
         img_audios, img_images, img_videos = process_mm_info(
             img_messages, use_audio_in_video=False
         )
-        hf_img_in = hf_processor(
-            text=[img_text],
-            audio=img_audios,
-            images=img_images,
-            videos=img_videos,
-            return_tensors="pt",
-            padding=True,
-        ).to(device)
+        hf_img_in = (
+            hf_processor(
+                text=[img_text],
+                audio=img_audios,
+                images=img_images,
+                videos=img_videos,
+                return_tensors="pt",
+                padding=True,
+            )
+            .to(device)
+            .to(hf_thinker.dtype)
+        )
 
         with torch.no_grad():
             hf_img_out = hf_thinker(**hf_img_in)
@@ -291,14 +297,18 @@ def precompute_hf_outputs(
         aud_audios, aud_images, aud_videos = process_mm_info(
             aud_messages, use_audio_in_video=False
         )
-        hf_aud_in = hf_processor(
-            text=[aud_text],
-            audio=aud_audios,
-            images=aud_images,
-            videos=aud_videos,
-            return_tensors="pt",
-            padding=True,
-        ).to(device)
+        hf_aud_in = (
+            hf_processor(
+                text=[aud_text],
+                audio=aud_audios,
+                images=aud_images,
+                videos=aud_videos,
+                return_tensors="pt",
+                padding=True,
+            )
+            .to(device)
+            .to(hf_thinker.dtype)
+        )
 
         with torch.no_grad():
             hf_aud_out = hf_thinker(**hf_aud_in)
