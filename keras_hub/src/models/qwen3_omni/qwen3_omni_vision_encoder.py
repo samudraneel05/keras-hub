@@ -58,15 +58,18 @@ class Qwen3OmniVisionPatchEmbed(layers.Layer):
 
         Args:
             pixel_values: Tensor with shape
-                `(batch_size, temporal, height, width, channels)`.
+                `(total_patches, temporal_patch_size, patch_size, patch_size,
+                channels)`
 
         Returns:
-            Tensor with shape `(batch_size, num_patches, embed_dim)`.
+            Tensor with shape `(total_flattened_tokens, embed_dim)`. When the
+            input already encodes one token per batch element (i.e. spatial
+            extent equals the patch size), the output is simply
+            `(total_patches, embed_dim)`.
         """
         hidden_states = self.proj(pixel_values)
-        batch_size = ops.shape(hidden_states)[0]
         embed_dim = ops.shape(hidden_states)[-1]
-        hidden_states = ops.reshape(hidden_states, [batch_size, -1, embed_dim])
+        hidden_states = ops.reshape(hidden_states, [-1, embed_dim])
         return hidden_states
 
     def get_config(self):
@@ -86,12 +89,16 @@ class Qwen3OmniVisionPatchEmbed(layers.Layer):
         temporal = input_shape[1]
         height = input_shape[2]
         width = input_shape[3]
-        num_patches = (
-            (temporal // self.temporal_patch_size)
-            * (height // self.patch_size)
-            * (width // self.patch_size)
-        )
-        return (batch_size, num_patches, self.embed_dim)
+        if None in (batch_size, temporal, height, width):
+            total_tokens = None
+        else:
+            total_tokens = (
+                batch_size
+                * (temporal // self.temporal_patch_size)
+                * (height // self.patch_size)
+                * (width // self.patch_size)
+            )
+        return (total_tokens, self.embed_dim)
 
 
 class Qwen3OmniVisionRotaryEmbedding(layers.Layer):
@@ -930,6 +937,48 @@ class Qwen3OmniVisionEncoder(keras.layers.Layer):
         """
         pixel_values = inputs["pixel_values"]
         grid_thw = inputs["grid_thw"]
+
+        # Accept both unbatched ``(N, t, p, p, c)`` and batched
+        # ``(batch, N, t, p, p, c)`` pixel_values (the latter is what the
+        # backbone's functional graph supplies). Same for ``grid_thw``.
+        if len(ops.shape(pixel_values)) == 6:
+            pixel_values = ops.reshape(
+                pixel_values,
+                (
+                    -1,
+                    self.temporal_patch_size,
+                    self.patch_size,
+                    self.patch_size,
+                    self.in_channels,
+                ),
+            )
+        if len(ops.shape(grid_thw)) == 3:
+            grid_thw = ops.reshape(grid_thw, (-1, 3))
+
+        # Early-exit for empty pixel_values (text-only forward through a
+        # multimodal backbone).
+        num_patches = ops.shape(pixel_values)[0]
+        if num_patches == 0:
+            empty_last = ops.zeros(
+                (1, 0, self.hidden_size),
+                dtype=self.compute_dtype,
+            )
+            empty_pooler = ops.zeros(
+                (1, 0, self.out_hidden_size),
+                dtype=self.compute_dtype,
+            )
+            empty_deepstack = [
+                ops.zeros(
+                    (1, 0, self.out_hidden_size),
+                    dtype=self.compute_dtype,
+                )
+                for _ in self.deepstack_visual_indexes
+            ]
+            return {
+                "last_hidden_state": empty_last,
+                "pooler_output": empty_pooler,
+                "deepstack_features": empty_deepstack,
+            }
 
         # Patch embedding: (total_patches, t, h, w, c) -> (1, total, hidden)
         hidden_states = self.patch_embed(pixel_values)

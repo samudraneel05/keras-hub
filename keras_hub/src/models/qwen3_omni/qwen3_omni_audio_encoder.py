@@ -8,6 +8,19 @@ from keras import ops
 from keras_hub.src.api_export import keras_hub_export
 
 
+def _get_feat_extract_output_length(input_length, n_window=100):
+    """Helps compute static block sizes for the windowed audio encoder without
+    running the torch-only utility.
+    """
+    input_length = int(input_length)
+    leave = input_length % n_window
+    feat_length = max(0, (leave - 1) // 2 + 1) if leave > 0 else 0
+    return (
+        max(0, (max(0, (feat_length - 1) // 2 + 1) - 1) // 2 + 1)
+        + (input_length // n_window) * 13
+    )
+
+
 def _create_sinusoidal_positions(length, channels, max_timescale=10000):
     """Create fixed sinusoidal positional embeddings."""
 
@@ -62,6 +75,15 @@ class Qwen3OmniAudioEncoder(keras.layers.Layer):
         activation_function: string. The activation function name.
             Defaults to `"gelu"`.
         dropout: float. The dropout rate. Defaults to `0.0`.
+        n_window: int. Mel-frame chunk half-width used by windowed
+            audio encoder. Each chunk spans ``n_window * 2`` mel frames.
+            Defaults to `100`.
+        n_window_infer: int. Inference-time window size (in mel frames)
+            used to derive the after-CNN attention block size. Defaults to
+            `400`.
+        conv_chunksize: int. CNN batch-chunk size used to bind
+            convolution memory. The Keras encoder currently runs the CNN as
+            a single pass. Defaults to `500`.
         dtype: string or `keras.mixed_precision.DTypePolicy`. The dtype to use
             for the model's computations and weights. Note that some
             computations, such as softmax and layer normalization will always
@@ -101,6 +123,9 @@ class Qwen3OmniAudioEncoder(keras.layers.Layer):
         scale_embedding=False,
         activation_function="gelu",
         dropout=0.0,
+        n_window=100,
+        n_window_infer=400,
+        conv_chunksize=500,
         dtype=None,
         **kwargs,
     ):
@@ -117,8 +142,15 @@ class Qwen3OmniAudioEncoder(keras.layers.Layer):
         self.scale_embedding = scale_embedding
         self.activation_function = activation_function
         self.dropout = dropout
+        self.n_window = n_window
+        self.n_window_infer = n_window_infer
+        self.conv_chunksize = conv_chunksize
 
         self.embed_scale = math.sqrt(d_model) if scale_embedding else 1.0
+        chunk_length = n_window * 2
+        chunk_length_after_cnn = max(1, -(-chunk_length // 8))
+        ratio = max(1, n_window_infer // chunk_length)
+        self.window_aftercnn = max(1, chunk_length_after_cnn * ratio)
 
         # === Convolutional downsampling layers ===
         self.conv2d1 = layers.Conv2D(
@@ -151,10 +183,6 @@ class Qwen3OmniAudioEncoder(keras.layers.Layer):
             use_bias=False,
             dtype=dtype,
             name="conv_out",
-        )
-
-        self._positional_embedding_np = _create_sinusoidal_positions(
-            max_source_positions, d_model
         )
 
         # === Transformer encoder layers ===
@@ -197,6 +225,23 @@ class Qwen3OmniAudioEncoder(keras.layers.Layer):
             dropout, dtype=dtype, name="dropout"
         )
 
+    def _build_window_attention_mask(self, seq_len):
+        """Return a block-diagonal self-attention mask.
+
+        The block size is ``self.window_aftercnn`` (see ``__init__``).
+        Returns a boolean tensor of shape ``(1, seq_len, seq_len)`` where
+        ``True`` positions are attended to. If ``seq_len`` fits within a
+        single window the mask is fully ``True`` and broadcasts cleanly.
+        """
+        window = int(self.window_aftercnn)
+        positions = ops.arange(seq_len, dtype="int32")
+        block_idx = positions // window
+        same_block = ops.equal(
+            ops.expand_dims(block_idx, 1),
+            ops.expand_dims(block_idx, 0),
+        )
+        return ops.expand_dims(same_block, axis=0)
+
     def _call_with_inputs(self, input_features, training=False):
         """Encode mel-spectrogram features into output embeddings.
 
@@ -208,6 +253,16 @@ class Qwen3OmniAudioEncoder(keras.layers.Layer):
         Returns:
             Tensor with shape `(batch_size, seq_len, output_dim)`.
         """
+        # Early-exit for zero-length time axis (text-only forward
+        # through a multimodal backbone).
+        time_steps = ops.shape(input_features)[1]
+        if time_steps == 0:
+            batch_size = ops.shape(input_features)[0]
+            return ops.zeros(
+                (batch_size, 0, self.output_dim),
+                dtype=self.compute_dtype,
+            )
+
         # Apply convolutional downsampling
         # Input: (batch, time, mel_bins) -> (batch, time, mel_bins, 1)
         hidden_states = ops.expand_dims(input_features, axis=-1)
@@ -232,16 +287,19 @@ class Qwen3OmniAudioEncoder(keras.layers.Layer):
         hidden_states = hidden_states * self.embed_scale
 
         # Add position embeddings
-        pos_embed_tensor = ops.convert_to_tensor(
-            self._positional_embedding_np, dtype=self.compute_dtype
+        positions = ops.cast(
+            self.positional_embedding[:seq_len, :], hidden_states.dtype
         )
-        positions = pos_embed_tensor[:seq_len, :]
         hidden_states = hidden_states + positions
+
+        # Build block-diagonal attention mask
+        attention_mask = self._build_window_attention_mask(seq_len)
 
         # Apply transformer encoder layers
         for encoder_layer in self.encoder_transformer_layers:
             hidden_states = encoder_layer(
                 hidden_states,
+                attention_mask=attention_mask,
                 training=training,
             )
 
@@ -270,6 +328,19 @@ class Qwen3OmniAudioEncoder(keras.layers.Layer):
         )
         self.conv_out.build(
             (None, None, mel_after_conv3 * self.downsample_hidden_size)
+        )
+
+        self.positional_embedding = self.add_weight(
+            name="positional_embedding",
+            shape=(self.max_source_positions, self.d_model),
+            initializer="zeros",
+            trainable=False,
+            dtype="float32",
+        )
+        self.positional_embedding.assign(
+            _create_sinusoidal_positions(
+                self.max_source_positions, self.d_model
+            )
         )
 
         encoder_input_shape = (None, None, self.d_model)
@@ -326,6 +397,9 @@ class Qwen3OmniAudioEncoder(keras.layers.Layer):
                 "scale_embedding": self.scale_embedding,
                 "activation_function": self.activation_function,
                 "dropout": self.dropout,
+                "n_window": self.n_window,
+                "n_window_infer": self.n_window_infer,
+                "conv_chunksize": self.conv_chunksize,
             }
         )
         return config
@@ -361,6 +435,7 @@ class Qwen3OmniAudioEncoderLayer(layers.Layer):
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.ffn_dim = ffn_dim
+        self.activation = activation
 
         self.self_attn = layers.MultiHeadAttention(
             num_heads=num_heads,
@@ -450,7 +525,7 @@ class Qwen3OmniAudioEncoderLayer(layers.Layer):
                 "embed_dim": self.embed_dim,
                 "num_heads": self.num_heads,
                 "ffn_dim": self.ffn_dim,
-                "activation": self.activation_fn.get_config()["activation"],
+                "activation": self.activation,
                 "dropout": self.dropout_layer.rate,
             }
         )
