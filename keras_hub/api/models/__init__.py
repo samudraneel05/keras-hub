@@ -627,6 +627,9 @@ from keras_hub.src.models.qwen3_moe.qwen3_moe_causal_lm_preprocessor import (
 from keras_hub.src.models.qwen3_omni.qwen3_omni_audio_converter import (
     Qwen3OmniAudioConverter as Qwen3OmniAudioConverter,
 )
+from keras_hub.src.models.qwen3_moe.qwen3_moe_tokenizer import (
+    Qwen3MoeTokenizer as Qwen3MoeTokenizer,
+)
 from keras_hub.src.models.qwen3_omni.qwen3_omni_audio_encoder import (
     Qwen3OmniAudioEncoder as Qwen3OmniAudioEncoder,
 )
