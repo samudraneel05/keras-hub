@@ -336,14 +336,13 @@ class Qwen3OmniBackbone(Backbone):
         # Normalise every value to a tensor before injecting defaults to
         # keep Keras's type-uniformity check happy.
         inputs = {k: ops.convert_to_tensor(v) for k, v in inputs.items()}
-        batch_size = ops.shape(inputs["token_ids"])[0]
         if self.has_vision:
             ve = self.vision_encoder
             inputs.setdefault(
                 "pixel_values",
                 ops.zeros(
                     (
-                        batch_size,
+                        0,
                         0,
                         ve.temporal_patch_size,
                         ve.patch_size,
@@ -353,20 +352,18 @@ class Qwen3OmniBackbone(Backbone):
                 ),
             )
             inputs.setdefault(
-                "image_grid_thw", ops.zeros((batch_size, 0, 3), dtype="int32")
+                "image_grid_thw", ops.zeros((0, 0, 3), dtype="int32")
             )
             inputs.setdefault(
-                "vision_indices", ops.zeros((batch_size, 0), dtype="int32")
+                "vision_indices", ops.zeros((0, 0), dtype="int32")
             )
         if self.has_audio:
             ae = self.audio_encoder
             inputs.setdefault(
                 "audio_features",
-                ops.zeros((batch_size, 0, ae.num_mel_bins)),
+                ops.zeros((0, 0, ae.num_mel_bins)),
             )
-            inputs.setdefault(
-                "audio_indices", ops.zeros((batch_size, 0), dtype="int32")
-            )
+            inputs.setdefault("audio_indices", ops.zeros((0, 0), dtype="int32"))
         return inputs
 
     def __call__(self, inputs, *args, **kwargs):
