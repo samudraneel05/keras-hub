@@ -122,3 +122,27 @@ class MultimodalRotaryEmbeddingTest(TestCase):
 
         with self.assertRaises(ValueError):
             MultimodalRotaryEmbedding(mrope_section=(2, 2, 2, 2))
+
+    def test_key_none_returns_rotated_query_only(self):
+        layer = MultimodalRotaryEmbedding(mrope_section=(2, 2, 2))
+        query = random.uniform(shape=(2, 3, 4, 12))
+        key = random.uniform(shape=(2, 3, 4, 12))
+        position_ids = np.array(
+            [
+                [[0, 1, 2], [3, 4, 5]],
+                [[0, 1, 2], [3, 4, 5]],
+                [[0, 1, 2], [3, 4, 5]],
+            ],
+            dtype=np.int32,
+        )
+
+        q_both, k_both = layer.apply_multimodal_rotary_embedding(
+            query, key, position_ids
+        )
+        q_only, k_only = layer.apply_multimodal_rotary_embedding(
+            query, None, position_ids
+        )
+
+        self.assertIsNone(k_only)
+        self.assertIsNotNone(k_both)
+        self.assertAllClose(q_both, q_only)

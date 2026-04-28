@@ -91,12 +91,14 @@ class MultimodalRotaryEmbedding(RotaryEmbedding):
             query: Query tensor of shape
                 `(batch, seq_len, num_heads, head_dim)`.
             key: Key tensor of shape `(batch, seq_len, num_heads, head_dim)`.
+                May be ``None`` when only the query needs to be rotated.
             position_ids: Position IDs of shape `(3, batch, seq_len)` where
                 `position_ids[0]` = text positions, `position_ids[1]` =
                 temporal positions, `position_ids[2]` = spatial positions.
 
         Returns:
-            Tuple of `(query_embed, key_embed)` with M-RoPE applied.
+            Tuple of `(query_embed, key_embed)` with M-RoPE applied. The
+            second element is ``None`` iff ``key`` was ``None``.
         """
         head_dim_half = sum(self.mrope_section)
         idx = ops.arange(0, head_dim_half * 2, 2, dtype="float32")
@@ -139,6 +141,8 @@ class MultimodalRotaryEmbedding(RotaryEmbedding):
         query_embed = self._apply_rotary_pos_emb_single(
             query, cos_full, sin_full
         )
+        if key is None:
+            return query_embed, None
         key_embed = self._apply_rotary_pos_emb_single(key, cos_full, sin_full)
 
         return query_embed, key_embed
