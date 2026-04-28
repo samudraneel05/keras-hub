@@ -19,6 +19,7 @@ import os
 import random
 import shutil
 import tempfile
+from collections import Counter
 from io import BytesIO
 
 os.environ["KERAS_BACKEND"] = "torch"
@@ -35,6 +36,13 @@ from transformers import AutoModelForMultimodalLM
 from transformers import AutoProcessor
 
 import keras_hub
+
+try:
+    import psutil
+
+    _PROCESS = psutil.Process()
+except ImportError:  # psutil is optional; diagnostics are best-effort
+    _PROCESS = None
 
 random.seed(123)
 np.random.seed(123)
@@ -205,9 +213,64 @@ def _freeze_keras_model(keras_model):
             t.requires_grad_(False)
 
 
-def _inference_mode():
-    """Context manager that disables autograd for the wrapped Keras call."""
-    return torch.inference_mode()
+def _log_rss(label):
+    """Print current resident set size in GB."""
+    if _PROCESS is None:
+        return
+    rss_gb = _PROCESS.memory_info().rss / (1024**3)
+    print(f"   [RSS] {label}: {rss_gb:.2f} GB")
+
+
+def _inspect_keras_dtypes(keras_model):
+    """Tally dtypes and byte-weight of Keras variables.
+
+    Prints a histogram and the total parameter memory. This is how we
+    distinguish between a real bf16 load (~60 GB) and a stealth-fp32
+    load (~120 GB) that would blow past 175 GB once activations arrive.
+    """
+    dtype_counts = Counter()
+    total_bytes = 0
+    for var in keras_model.variables:
+        t = getattr(var, "value", var)
+        if not hasattr(t, "dtype"):
+            continue
+        dt = str(t.dtype).replace("torch.", "")
+        n = 1
+        for s in tuple(t.shape):
+            n *= int(s)
+        dtype_counts[dt] += n
+        total_bytes += n * t.element_size()
+
+    print("   [DTYPE]")
+    for dt, n in dtype_counts.most_common():
+        print(f"     {dt:>10}: {n:>14,} params")
+    print(f"   [DTYPE] total weight bytes: {total_bytes / (1024**3):.2f} GB")
+
+
+def _force_cast_model_to(keras_model, torch_dtype):
+    """Manually cast every Keras variable's underlying torch tensor.
+
+    Keras's ``from_preset(dtype=...)`` sets the model's compute dtype policy
+    but does not always materialize the underlying weights in that dtype —
+    the variables can end up as fp32 Parameters even when bf16 was asked
+    for. This helper walks every variable and calls ``.data.to(torch_dtype)``
+    in place so the memory actually shrinks.
+    """
+    n_cast = 0
+    for var in keras_model.variables:
+        t = getattr(var, "value", var)
+        if not hasattr(t, "dtype"):
+            continue
+        if t.dtype != torch_dtype:
+            # In-place replace the underlying storage with a cast copy.
+            # We use .data.set_() to avoid creating a new Parameter object
+            # that would detach it from the Keras graph.
+            new_t = t.data.to(torch_dtype)
+            t.data = new_t
+            n_cast += 1
+    if n_cast:
+        print(f"   [CAST] Force-cast {n_cast} variables to {torch_dtype}.")
+    return n_cast
 
 
 # ---------------------------------------------------------------
@@ -580,7 +643,7 @@ def validate_text_output(keras_model, cache_dir, dtype_str):
 
     token_ids = ops.convert_to_tensor(hf_ids.astype(np.int32))
     padding_mask = ops.ones_like(token_ids)
-    with _inference_mode():
+    with torch.inference_mode():
         keras_hidden = keras_model.backbone(
             {"token_ids": token_ids, "padding_mask": padding_mask}
         )
@@ -598,7 +661,7 @@ def validate_text_output(keras_model, cache_dir, dtype_str):
 
     if not FLAGS.skip_generation:
         print("\n  Generating...")
-        with _inference_mode():
+        with torch.inference_mode():
             out = keras_model.generate(TEXT_PROMPT, max_length=64)
         print(f"  KerasHub: {_extract_response(out)}")
         print(f"  HF:       {meta.get('generated', 'N/A')}")
@@ -630,8 +693,9 @@ def validate_image_output(keras_model, cache_dir, dtype_str):
     hf_logits = arrays["logits"]
     print(f"\n  KerasHub pixel_values shape: {pixel_values_np.shape}")
     del pixel_values_np
+    _log_rss("image: before backbone forward")
 
-    with _inference_mode():
+    with torch.inference_mode():
         keras_hidden = backbone(
             {
                 "token_ids": token_ids,
@@ -640,9 +704,12 @@ def validate_image_output(keras_model, cache_dir, dtype_str):
                 "grid_thw": grid_thw,
             }
         )
+        _log_rss("image: after backbone forward")
         keras_logits = backbone.token_embedding(keras_hidden, reverse=True)
+        _log_rss("image: after logit projection")
         keras_logits = ops.convert_to_numpy(keras_logits).astype(np.float32)
     del keras_hidden, token_ids, padding_mask, pixel_values, grid_thw
+    _log_rss("image: after tensor cleanup")
 
     _print_logit_diff(
         keras_logits, hf_logits, "Image", _logit_tolerance(dtype_str)
@@ -650,13 +717,14 @@ def validate_image_output(keras_model, cache_dir, dtype_str):
     prompt_len = int(arrays["input_ids"].shape[1])
     del keras_logits, hf_logits, arrays
     _free()
+    _log_rss("image: after logit diff")
 
     if not FLAGS.skip_generation:
         print(f"\n  HF: {meta.get('generated', 'N/A')}")
         raw_image = np.array(
             Image.open(os.path.join(cache_dir, "image.png")).convert("RGB")
         )
-        with _inference_mode():
+        with torch.inference_mode():
             out = keras_model.generate(
                 {"prompts": [IMAGE_PROMPT], "images": [raw_image]},
                 max_length=prompt_len + 32,
@@ -687,7 +755,7 @@ def validate_audio_output(keras_model, cache_dir, dtype_str):
     hf_logits = arrays["logits"]
     print(f"\n  audio_features shape: {arrays['input_features'].shape}")
 
-    with _inference_mode():
+    with torch.inference_mode():
         keras_hidden = keras_model.backbone(
             {
                 "token_ids": token_ids,
@@ -711,7 +779,7 @@ def validate_audio_output(keras_model, cache_dir, dtype_str):
     if not FLAGS.skip_generation:
         print(f"\n  HF: {meta.get('generated', 'N/A')}")
         audio_np = np.load(os.path.join(cache_dir, "audio.npy"))
-        with _inference_mode():
+        with torch.inference_mode():
             out = keras_model.generate(
                 {"prompts": [AUDIO_PROMPT], "audio": [audio_np]},
                 max_length=prompt_len + 32,
@@ -757,7 +825,7 @@ def validate_video_output(keras_model, cache_dir, dtype_str):
     print(f"\n  KerasHub video pixel_values shape: {pixel_values_np.shape}")
     del pixel_values_np
 
-    with _inference_mode():
+    with torch.inference_mode():
         keras_hidden = backbone(
             {
                 "token_ids": token_ids,
@@ -787,7 +855,7 @@ def validate_video_output(keras_model, cache_dir, dtype_str):
         ]
         if frames:
             video_frames_np = np.stack(frames)
-            with _inference_mode():
+            with torch.inference_mode():
                 out = keras_model.generate(
                     {"prompts": [VIDEO_PROMPT], "video": [video_frames_np]},
                     max_length=prompt_len + 32,
@@ -883,10 +951,24 @@ def main(_):
         # Phase B: Load KerasHub, validate each modality from disk.
         # =================================================================
         print("\n-> Loading KerasHub model from HF preset...")
+        _log_rss("before Keras load")
         keras_model = keras_hub.models.Qwen3OmniCausalLM.from_preset(
             f"hf://{hf_preset}", dtype=dtype_str
         )
         _freeze_keras_model(keras_model)
+        _log_rss("after Keras load")
+        _inspect_keras_dtypes(keras_model)
+
+        # If the user asked for bf16 but from_preset left weights in fp32
+        # (e.g. because the preset's dtype policy only sets compute_dtype),
+        # force-cast them now. Otherwise the "60 GB bf16 model" is silently
+        # a "120 GB fp32 model" and activations OOM us on image validation.
+        if dtype_str != "float32":
+            _force_cast_model_to(keras_model, torch_dtype)
+            _free()
+            _log_rss("after force cast")
+            _inspect_keras_dtypes(keras_model)
+
         _free()
         print("   KerasHub model loaded (autograd disabled, params frozen)!")
 

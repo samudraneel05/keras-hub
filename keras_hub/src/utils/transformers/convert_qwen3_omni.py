@@ -14,6 +14,26 @@ def _transpose_and_reshape(x, shape):
     return np.reshape(np.transpose(x), shape)
 
 
+def _transpose_2d(x, _):
+    """Swap the two axes of a ``(out, in)`` HF dense kernel."""
+    return np.transpose(x, (1, 0))
+
+
+def _reshape(x, shape):
+    """Reshape a flat HF bias to a Keras per-head bias."""
+    return np.reshape(x, shape)
+
+
+def _conv2d_transpose(x, _):
+    """HF Conv2D ``(out, in, H, W)`` -> Keras ``(H, W, in, out)``."""
+    return np.transpose(x, (2, 3, 1, 0))
+
+
+def _conv3d_transpose(x, _):
+    """HF Conv3D ``(out, in, D, H, W)`` -> Keras ``(D, H, W, in, out)``."""
+    return np.transpose(x, (2, 3, 4, 1, 0))
+
+
 def _compute_scale_offset(image_mean, image_std, rescale_factor=1.0 / 255):
     """Compute KerasHub scale/offset from HF image_mean and image_std.
 
@@ -32,8 +52,10 @@ def convert_backbone_config(transformers_config):
     """Convert HuggingFace Qwen3-Omni config to KerasHub config."""
     thinker_config = transformers_config.get("thinker_config", {})
     text_config = thinker_config.get("text_config", transformers_config)
-    rope_scaling = text_config.get("rope_scaling", {})
-    mrope_section = rope_scaling.get("mrope_section", [24, 20, 20])
+    rope_params = text_config.get("rope_parameters") or text_config.get(
+        "rope_scaling", {}
+    )
+    mrope_section = rope_params.get("mrope_section", [24, 20, 20])
     backbone_config = {
         "vocabulary_size": text_config["vocab_size"],
         "hidden_dim": text_config["hidden_size"],
@@ -60,14 +82,8 @@ def convert_backbone_config(transformers_config):
         "tie_word_embeddings": text_config.get("tie_word_embeddings", False),
     }
 
-    backbone_config["image_token_id"] = thinker_config.get(
-        "image_token_id", 151655
-    )
-    backbone_config["video_token_id"] = thinker_config.get(
-        "video_token_id", 151656
-    )
-    backbone_config["audio_token_id"] = thinker_config.get(
-        "audio_token_id", 151675
+    backbone_config["position_id_per_seconds"] = thinker_config.get(
+        "position_id_per_seconds", 25
     )
 
     audio_config = thinker_config.get("audio_config")
@@ -90,6 +106,9 @@ def convert_backbone_config(transformers_config):
             scale_embedding=audio_config.get("scale_embedding", False),
             activation_function=audio_config.get("activation_function", "gelu"),
             dropout=audio_config.get("dropout", 0.0),
+            n_window=audio_config.get("n_window", 100),
+            n_window_infer=audio_config.get("n_window_infer", 400),
+            conv_chunksize=audio_config.get("conv_chunksize", 500),
         )
 
     vision_config = thinker_config.get("vision_config")
@@ -118,10 +137,12 @@ def convert_backbone_config(transformers_config):
 
 
 def convert_weights(backbone, loader, transformers_config):
-    """Convert HF Thinker weights to KerasHub backbone."""
-    # ------------------------------------------------------------------
-    # Track ported HF keys so _audit_weights can verify full coverage.
-    # ------------------------------------------------------------------
+    """Port HF Thinker weights into ``backbone`` in place.
+
+    Records every HF key that is consumed and asserts full Thinker
+    coverage against the loader's safetensors index at the end (see
+    ``_audit_weights``). Talker / MTP / code2wav keys are skipped.
+    """
     ported_hf_keys = set()
 
     def _port(keras_variable, hf_weight_key, hook_fn=None):
@@ -135,16 +156,10 @@ def convert_weights(backbone, loader, transformers_config):
         if not audio_enc.built:
             audio_enc.build()
 
-        # Conv downsampling layers
-        def conv2d_transpose(x, _):
-            # PyTorch Conv2D: (out_channels, in_channels, H, W)
-            # Keras Conv2D: (H, W, in_channels, out_channels)
-            return np.transpose(x, (2, 3, 1, 0))
-
         _port(
             keras_variable=audio_enc.conv2d1.kernel,
             hf_weight_key="audio_tower.conv2d1.weight",
-            hook_fn=conv2d_transpose,
+            hook_fn=_conv2d_transpose,
         )
         _port(
             keras_variable=audio_enc.conv2d1.bias,
@@ -153,7 +168,7 @@ def convert_weights(backbone, loader, transformers_config):
         _port(
             keras_variable=audio_enc.conv2d2.kernel,
             hf_weight_key="audio_tower.conv2d2.weight",
-            hook_fn=conv2d_transpose,
+            hook_fn=_conv2d_transpose,
         )
         _port(
             keras_variable=audio_enc.conv2d2.bias,
@@ -162,7 +177,7 @@ def convert_weights(backbone, loader, transformers_config):
         _port(
             keras_variable=audio_enc.conv2d3.kernel,
             hf_weight_key="audio_tower.conv2d3.weight",
-            hook_fn=conv2d_transpose,
+            hook_fn=_conv2d_transpose,
         )
         _port(
             keras_variable=audio_enc.conv2d3.bias,
@@ -172,7 +187,7 @@ def convert_weights(backbone, loader, transformers_config):
         _port(
             keras_variable=audio_enc.conv_out.kernel,
             hf_weight_key="audio_tower.conv_out.weight",
-            hook_fn=lambda x, _: np.transpose(x, (1, 0)),
+            hook_fn=_transpose_2d,
         )
 
         # Transformer encoder layers
@@ -196,7 +211,7 @@ def convert_weights(backbone, loader, transformers_config):
             _port(
                 keras_variable=layer.self_attn._query_dense.bias,
                 hf_weight_key=f"audio_tower.layers.{i}.self_attn.q_proj.bias",
-                hook_fn=lambda x, shape: np.reshape(x, shape),
+                hook_fn=_reshape,
             )
             _port(
                 keras_variable=layer.self_attn._key_dense.kernel,
@@ -206,7 +221,7 @@ def convert_weights(backbone, loader, transformers_config):
             _port(
                 keras_variable=layer.self_attn._key_dense.bias,
                 hf_weight_key=f"audio_tower.layers.{i}.self_attn.k_proj.bias",
-                hook_fn=lambda x, shape: np.reshape(x, shape),
+                hook_fn=_reshape,
             )
             _port(
                 keras_variable=layer.self_attn._value_dense.kernel,
@@ -216,7 +231,7 @@ def convert_weights(backbone, loader, transformers_config):
             _port(
                 keras_variable=layer.self_attn._value_dense.bias,
                 hf_weight_key=f"audio_tower.layers.{i}.self_attn.v_proj.bias",
-                hook_fn=lambda x, shape: np.reshape(x, shape),
+                hook_fn=_reshape,
             )
             _port(
                 keras_variable=layer.self_attn._output_dense.kernel,
@@ -240,7 +255,7 @@ def convert_weights(backbone, loader, transformers_config):
             _port(
                 keras_variable=layer.fc1.kernel,
                 hf_weight_key=f"audio_tower.layers.{i}.fc1.weight",
-                hook_fn=lambda x, _: np.transpose(x, (1, 0)),
+                hook_fn=_transpose_2d,
             )
             _port(
                 keras_variable=layer.fc1.bias,
@@ -249,7 +264,7 @@ def convert_weights(backbone, loader, transformers_config):
             _port(
                 keras_variable=layer.fc2.kernel,
                 hf_weight_key=f"audio_tower.layers.{i}.fc2.weight",
-                hook_fn=lambda x, _: np.transpose(x, (1, 0)),
+                hook_fn=_transpose_2d,
             )
             _port(
                 keras_variable=layer.fc2.bias,
@@ -270,7 +285,7 @@ def convert_weights(backbone, loader, transformers_config):
         _port(
             keras_variable=audio_enc.proj1.kernel,
             hf_weight_key="audio_tower.proj1.weight",
-            hook_fn=lambda x, _: np.transpose(x, (1, 0)),
+            hook_fn=_transpose_2d,
         )
         _port(
             keras_variable=audio_enc.proj1.bias,
@@ -279,7 +294,7 @@ def convert_weights(backbone, loader, transformers_config):
         _port(
             keras_variable=audio_enc.proj2.kernel,
             hf_weight_key="audio_tower.proj2.weight",
-            hook_fn=lambda x, _: np.transpose(x, (1, 0)),
+            hook_fn=_transpose_2d,
         )
         _port(
             keras_variable=audio_enc.proj2.bias,
@@ -292,16 +307,10 @@ def convert_weights(backbone, loader, transformers_config):
         if not vision_enc.built:
             vision_enc.build()
 
-        # Patch embedding (Conv3D)
-        def conv3d_transpose(x, _):
-            # PyTorch Conv3D: (out_channels, in_channels, D, H, W)
-            # Keras Conv3D: (D, H, W, in_channels, out_channels)
-            return np.transpose(x, (2, 3, 4, 1, 0))
-
         _port(
             keras_variable=vision_enc.patch_embed.proj.kernel,
             hf_weight_key="visual.patch_embed.proj.weight",
-            hook_fn=conv3d_transpose,
+            hook_fn=_conv3d_transpose,
         )
         _port(
             keras_variable=vision_enc.patch_embed.proj.bias,
@@ -340,7 +349,7 @@ def convert_weights(backbone, loader, transformers_config):
             _port(
                 keras_variable=block.attn.qkv.kernel,
                 hf_weight_key=f"visual.blocks.{i}.attn.qkv.weight",
-                hook_fn=lambda x, _: np.transpose(x, (1, 0)),
+                hook_fn=_transpose_2d,
             )
             _port(
                 keras_variable=block.attn.qkv.bias,
@@ -349,7 +358,7 @@ def convert_weights(backbone, loader, transformers_config):
             _port(
                 keras_variable=block.attn.proj.kernel,
                 hf_weight_key=f"visual.blocks.{i}.attn.proj.weight",
-                hook_fn=lambda x, _: np.transpose(x, (1, 0)),
+                hook_fn=_transpose_2d,
             )
             _port(
                 keras_variable=block.attn.proj.bias,
@@ -358,7 +367,7 @@ def convert_weights(backbone, loader, transformers_config):
             _port(
                 keras_variable=block.mlp.fc1.kernel,
                 hf_weight_key=f"visual.blocks.{i}.mlp.linear_fc1.weight",
-                hook_fn=lambda x, _: np.transpose(x, (1, 0)),
+                hook_fn=_transpose_2d,
             )
             _port(
                 keras_variable=block.mlp.fc1.bias,
@@ -367,7 +376,7 @@ def convert_weights(backbone, loader, transformers_config):
             _port(
                 keras_variable=block.mlp.fc2.kernel,
                 hf_weight_key=f"visual.blocks.{i}.mlp.linear_fc2.weight",
-                hook_fn=lambda x, _: np.transpose(x, (1, 0)),
+                hook_fn=_transpose_2d,
             )
             _port(
                 keras_variable=block.mlp.fc2.bias,
@@ -385,7 +394,7 @@ def convert_weights(backbone, loader, transformers_config):
         _port(
             keras_variable=vision_enc.merger.mlp_fc1.kernel,
             hf_weight_key="visual.merger.mlp.0.weight",
-            hook_fn=lambda x, _: np.transpose(x, (1, 0)),
+            hook_fn=_transpose_2d,
         )
         _port(
             keras_variable=vision_enc.merger.mlp_fc1.bias,
@@ -394,7 +403,7 @@ def convert_weights(backbone, loader, transformers_config):
         _port(
             keras_variable=vision_enc.merger.mlp_fc2.kernel,
             hf_weight_key="visual.merger.mlp.2.weight",
-            hook_fn=lambda x, _: np.transpose(x, (1, 0)),
+            hook_fn=_transpose_2d,
         )
         _port(
             keras_variable=vision_enc.merger.mlp_fc2.bias,
@@ -415,7 +424,7 @@ def convert_weights(backbone, loader, transformers_config):
             _port(
                 keras_variable=merger.mlp_fc1.kernel,
                 hf_weight_key=f"visual.merger_list.{j}.mlp.0.weight",
-                hook_fn=lambda x, _: np.transpose(x, (1, 0)),
+                hook_fn=_transpose_2d,
             )
             _port(
                 keras_variable=merger.mlp_fc1.bias,
@@ -424,7 +433,7 @@ def convert_weights(backbone, loader, transformers_config):
             _port(
                 keras_variable=merger.mlp_fc2.kernel,
                 hf_weight_key=f"visual.merger_list.{j}.mlp.2.weight",
-                hook_fn=lambda x, _: np.transpose(x, (1, 0)),
+                hook_fn=_transpose_2d,
             )
             _port(
                 keras_variable=merger.mlp_fc2.bias,
@@ -442,7 +451,7 @@ def convert_weights(backbone, loader, transformers_config):
                 "token_embedding"
             ).reverse_embeddings,
             hf_weight_key="lm_head.weight",
-            hook_fn=lambda hf_tensor, _: np.transpose(hf_tensor, axes=(1, 0)),
+            hook_fn=_transpose_2d,
         )
 
     for i in range(backbone.num_layers):
@@ -499,9 +508,7 @@ def convert_weights(backbone, loader, transformers_config):
             _port(
                 keras_variable=decoder_layer.sparse_moe._sparse_feedforward_gate_dense.kernel,
                 hf_weight_key=f"model.layers.{i}.mlp.gate.weight",
-                hook_fn=lambda hf_tensor, _: np.transpose(
-                    hf_tensor, axes=(1, 0)
-                ),
+                hook_fn=_transpose_2d,
             )
             # Batched experts: gate_up_proj and down_proj
             gate_up_proj_list = []
@@ -556,23 +563,17 @@ def convert_weights(backbone, loader, transformers_config):
             _port(
                 keras_variable=decoder_layer.dense_mlp._feedforward_intermediate_dense.kernel,
                 hf_weight_key=f"model.layers.{i}.mlp.up_proj.weight",
-                hook_fn=lambda hf_tensor, _: np.transpose(
-                    hf_tensor, axes=(1, 0)
-                ),
+                hook_fn=_transpose_2d,
             )
             _port(
                 keras_variable=decoder_layer.dense_mlp._feedforward_output_dense.kernel,
                 hf_weight_key=f"model.layers.{i}.mlp.down_proj.weight",
-                hook_fn=lambda hf_tensor, _: np.transpose(
-                    hf_tensor, axes=(1, 0)
-                ),
+                hook_fn=_transpose_2d,
             )
             _port(
                 keras_variable=decoder_layer.dense_mlp._feedforward_gate_dense.kernel,
                 hf_weight_key=f"model.layers.{i}.mlp.gate_proj.weight",
-                hook_fn=lambda hf_tensor, _: np.transpose(
-                    hf_tensor, axes=(1, 0)
-                ),
+                hook_fn=_transpose_2d,
             )
 
         # Feedforward layernorm
@@ -588,21 +589,18 @@ def convert_weights(backbone, loader, transformers_config):
         hf_weight_key="model.norm.weight",
     )
 
-    # ------------------------------------------------------------------
-    # Audit
-    # ------------------------------------------------------------------
     _audit_weights(backbone, loader, ported_hf_keys)
-
-    return backbone
 
 
 def _audit_weights(backbone, loader, ported_hf_keys):
-    """Verify that all expected HF Thinker weights were ported.
+    """Verify every expected HF Thinker weight was ported.
 
-    Compares ported keys against the safetensors weight map, reporting any
-    HF weights that were silently skipped. Known exclusions:
-    - ``mtp.*``   — multi-token prediction training heads
-    - ``talker.*`` — Talker (speech decoder) not implemented in KerasHub
+    Compares ported keys against the safetensors weight map. Known
+    non-Thinker prefixes are skipped:
+
+    - ``mtp.*``      multi-token prediction training heads
+    - ``talker.*``   Talker speech decoder (not implemented in KerasHub)
+    - ``code2wav.*`` Talker-side vocoder
     """
     if (
         not hasattr(loader, "safetensor_config")
@@ -613,7 +611,7 @@ def _audit_weights(backbone, loader, ported_hf_keys):
 
     all_hf_keys = set(loader.safetensor_config["weight_map"].keys())
 
-    skip_prefixes = ("mtp.", "talker.")
+    skip_prefixes = ("mtp.", "talker.", "code2wav.")
     skipped_keys = {
         k for k in all_hf_keys if any(k.startswith(p) for p in skip_prefixes)
     }
@@ -635,7 +633,7 @@ def _audit_weights(backbone, loader, ported_hf_keys):
         print(
             f"[AUDIT] All {len(expected_keys)} expected Thinker weights "
             f"ported successfully "
-            f"({len(skipped_keys)} talker/mtp keys skipped)."
+            f"({len(skipped_keys)} talker/mtp/code2wav keys skipped)."
         )
 
     print(f"[AUDIT] KerasHub parameter count: {backbone.count_params():,}")
