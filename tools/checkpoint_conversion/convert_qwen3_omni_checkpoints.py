@@ -173,12 +173,15 @@ def _count_keras_params(backbone):
 
 
 def _pixel_values_hf_to_keras(pixel_values_np, vision_encoder):
-    """Reshape HF flat pixel patches to KerasHub (N, T, pH, pW, C)."""
+    """Reshape HF flat pixel patches to KerasHub (1, N, T, pH, pW, C)."""
     C = vision_encoder.in_channels
     T = vision_encoder.temporal_patch_size
     pH = pW = vision_encoder.patch_size
     flat = pixel_values_np.reshape(-1, C, T, pH, pW)
-    return np.transpose(flat, (0, 2, 3, 4, 1))
+    # (N, C, T, pH, pW) -> (N, T, pH, pW, C)
+    patches = np.transpose(flat, (0, 2, 3, 4, 1))
+    # Add batch dimension: (N, T, pH, pW, C) -> (1, N, T, pH, pW, C)
+    return patches[np.newaxis]
 
 
 def _logit_tolerance(dtype_str):
@@ -689,7 +692,7 @@ def validate_image_output(keras_model, cache_dir, dtype_str):
     padding_mask = ops.convert_to_tensor(arrays["attention_mask"])
     pixel_values_np = _pixel_values_hf_to_keras(arrays["pixel_values"], ve)
     pixel_values = ops.convert_to_tensor(pixel_values_np)
-    grid_thw = ops.convert_to_tensor(arrays["grid_thw"])
+    grid_thw = ops.convert_to_tensor(arrays["grid_thw"][np.newaxis])
     hf_logits = arrays["logits"]
     print(f"\n  KerasHub pixel_values shape: {pixel_values_np.shape}")
     del pixel_values_np
@@ -701,7 +704,7 @@ def validate_image_output(keras_model, cache_dir, dtype_str):
                 "token_ids": token_ids,
                 "padding_mask": padding_mask,
                 "pixel_values": pixel_values,
-                "grid_thw": grid_thw,
+                "image_grid_thw": grid_thw,
             }
         )
         _log_rss("image: after backbone forward")
@@ -820,7 +823,7 @@ def validate_video_output(keras_model, cache_dir, dtype_str):
     padding_mask = ops.convert_to_tensor(arrays["attention_mask"])
     pixel_values_np = _pixel_values_hf_to_keras(arrays["pixel_values"], ve)
     pixel_values = ops.convert_to_tensor(pixel_values_np)
-    grid_thw = ops.convert_to_tensor(arrays["grid_thw"])
+    grid_thw = ops.convert_to_tensor(arrays["grid_thw"][np.newaxis])
     hf_logits = arrays["logits"]
     print(f"\n  KerasHub video pixel_values shape: {pixel_values_np.shape}")
     del pixel_values_np
@@ -831,7 +834,7 @@ def validate_video_output(keras_model, cache_dir, dtype_str):
                 "token_ids": token_ids,
                 "padding_mask": padding_mask,
                 "pixel_values": pixel_values,
-                "grid_thw": grid_thw,
+                "image_grid_thw": grid_thw,
             }
         )
         keras_logits = backbone.token_embedding(keras_hidden, reverse=True)
