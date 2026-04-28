@@ -639,6 +639,9 @@ from keras_hub.src.models.qwen3_omni.qwen3_omni_causal_lm import (
 from keras_hub.src.models.qwen3_omni.qwen3_omni_causal_lm_preprocessor import (
     Qwen3OmniCausalLMPreprocessor as Qwen3OmniCausalLMPreprocessor,
 )
+from keras_hub.src.models.qwen3_omni.qwen3_omni_tokenizer import (
+    Qwen3OmniTokenizer as Qwen3OmniTokenizer,
+)
 from keras_hub.src.models.qwen3_omni.qwen3_omni_vision_encoder import (
     Qwen3OmniVisionEncoder as Qwen3OmniVisionEncoder,
 )

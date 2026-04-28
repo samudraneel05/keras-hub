@@ -6,13 +6,15 @@ from keras_hub.src.tokenizers.byte_pair_tokenizer import BytePairTokenizer
 
 
 @keras_hub_export(
-    "keras_hub.tokenizers.Qwen3OmniTokenizer",
+    [
+        "keras_hub.tokenizers.Qwen3OmniTokenizer",
+        "keras_hub.models.Qwen3OmniTokenizer",
+    ]
 )
 class Qwen3OmniTokenizer(BytePairTokenizer):
     """Tokenizer for Qwen3-Omni model.
 
-    This tokenizer implements byte-pair encoding (BPE) for Qwen3-Omni models,
-    handling special tokens like EOS (end of sequence) and PAD (padding).
+    This tokenizer implements byte-pair encoding (BPE) for Qwen3-Omni models.
 
     Args:
         vocabulary: Dictionary mapping tokens to token IDs, or path to
@@ -42,11 +44,9 @@ class Qwen3OmniTokenizer(BytePairTokenizer):
         merges=None,
         **kwargs,
     ):
-        eos_token = "<|im_end|>"
-        self._add_special_token(eos_token, "end_token")
-
-        pad_token = "<|endoftext|>"
-        self._add_special_token(pad_token, "pad_token")
+        self._add_special_token("<|im_end|>", "end_token")
+        self._add_special_token("<|endoftext|>", "pad_token")
+        self._add_special_token("<|im_start|>", "im_start_token")
 
         self.start_token_id = None
         self.start_token = None
@@ -56,3 +56,15 @@ class Qwen3OmniTokenizer(BytePairTokenizer):
             merges=merges,
             **kwargs,
         )
+
+        self._add_special_token("<|vision_start|>", "vision_start_token")
+        self._add_special_token("<|vision_end|>", "vision_end_token")
+        self._add_special_token("<|image_pad|>", "image_token")
+        self._add_special_token("<|video_pad|>", "video_token")
+
+        self._add_special_token("<|audio_start|>", "audio_start_token")
+        self._add_special_token("<|audio_end|>", "audio_end_token")
+        self._add_special_token("<|audio_pad|>", "audio_token")
+
+        if vocabulary is not None:
+            self._update_special_token_ids()

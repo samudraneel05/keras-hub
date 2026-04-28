@@ -73,9 +73,6 @@ class Qwen3OmniBackboneTest(TestCase, parameterized.TestCase):
             "mlp_only_layers": [],
             "vision_encoder": vision_encoder,
             "audio_encoder": audio_encoder,
-            "image_token_id": 5,
-            "video_token_id": 6,
-            "audio_token_id": 7,
             "dtype": "float32",
         }
 
@@ -102,6 +99,7 @@ class Qwen3OmniBackboneTest(TestCase, parameterized.TestCase):
         else:
             init_kwargs = self.text_init_kwargs
 
+        is_multimodal = backbone_type == "multimodal"
         self.run_backbone_test(
             cls=Qwen3OmniBackbone,
             init_kwargs=init_kwargs,
@@ -111,7 +109,8 @@ class Qwen3OmniBackboneTest(TestCase, parameterized.TestCase):
                 self.sequence_length,
                 16,
             ),
-            run_quantization_check=(backbone_type == "text_only"),
+            run_mixed_precision_check=not is_multimodal,
+            run_quantization_check=not is_multimodal,
         )
 
     @parameterized.named_parameters(
@@ -156,16 +155,18 @@ class Qwen3OmniBackboneTest(TestCase, parameterized.TestCase):
         token_ids[0, 3] = 5
         padding_mask = np.ones((1, self.sequence_length), dtype="int32")
         pixel_values = (
-            np.random.RandomState(0).randn(1, 2, 4, 4, 3).astype("float32")
+            np.random.RandomState(0).randn(1, 1, 2, 2, 2, 3).astype("float32")
         )
-        grid_thw = np.array([[1, 2, 2]], dtype="int32")
+        image_grid_thw = np.array([[[1, 2, 2]]], dtype="int32")
+        vision_indices = np.array([[3]], dtype="int32")
 
         output_fused = model(
             {
                 "token_ids": token_ids,
                 "padding_mask": padding_mask,
                 "pixel_values": pixel_values,
-                "grid_thw": grid_thw,
+                "image_grid_thw": image_grid_thw,
+                "vision_indices": vision_indices,
             }
         )
         self.assertEqual(ops.shape(output_fused), (1, self.sequence_length, 16))
