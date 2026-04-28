@@ -691,7 +691,7 @@ def validate_image_output(keras_model, cache_dir, dtype_str):
     token_ids = ops.convert_to_tensor(arrays["input_ids"])
     padding_mask = ops.convert_to_tensor(arrays["attention_mask"])
     pixel_values_np = _pixel_values_hf_to_keras(arrays["pixel_values"], ve)
-    pixel_values = ops.convert_to_tensor(pixel_values_np)
+    pixel_values = ops.cast(ops.convert_to_tensor(pixel_values_np), dtype_str)
     grid_thw = ops.convert_to_tensor(arrays["grid_thw"][np.newaxis])
     hf_logits = arrays["logits"]
     print(f"\n  KerasHub pixel_values shape: {pixel_values_np.shape}")
@@ -754,7 +754,9 @@ def validate_audio_output(keras_model, cache_dir, dtype_str):
     arrays, meta = _load_arrays(cache_dir, "audio")
     token_ids = ops.convert_to_tensor(arrays["input_ids"])
     padding_mask = ops.convert_to_tensor(arrays["attention_mask"])
-    audio_features = ops.convert_to_tensor(arrays["input_features"])
+    audio_features = ops.cast(
+        ops.convert_to_tensor(arrays["input_features"]), dtype_str
+    )
     hf_logits = arrays["logits"]
     print(f"\n  audio_features shape: {arrays['input_features'].shape}")
 
@@ -822,7 +824,7 @@ def validate_video_output(keras_model, cache_dir, dtype_str):
     token_ids = ops.convert_to_tensor(arrays["input_ids"])
     padding_mask = ops.convert_to_tensor(arrays["attention_mask"])
     pixel_values_np = _pixel_values_hf_to_keras(arrays["pixel_values"], ve)
-    pixel_values = ops.convert_to_tensor(pixel_values_np)
+    pixel_values = ops.cast(ops.convert_to_tensor(pixel_values_np), dtype_str)
     grid_thw = ops.convert_to_tensor(arrays["grid_thw"][np.newaxis])
     hf_logits = arrays["logits"]
     print(f"\n  KerasHub video pixel_values shape: {pixel_values_np.shape}")
