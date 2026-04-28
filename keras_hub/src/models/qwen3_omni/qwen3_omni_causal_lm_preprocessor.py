@@ -1,4 +1,8 @@
+import re
+
 import keras
+import numpy as np
+import tensorflow as tf
 from keras import ops
 
 from keras_hub.src.api_export import keras_hub_export
@@ -8,6 +12,9 @@ from keras_hub.src.layers.preprocessing.multi_segment_packer import (
 from keras_hub.src.models.causal_lm_preprocessor import CausalLMPreprocessor
 from keras_hub.src.models.qwen3_omni.qwen3_omni_audio_converter import (
     Qwen3OmniAudioConverter,
+)
+from keras_hub.src.models.qwen3_omni.qwen3_omni_audio_encoder import (
+    _get_feat_extract_output_length,
 )
 from keras_hub.src.models.qwen3_omni.qwen3_omni_backbone import (
     Qwen3OmniBackbone,
@@ -28,39 +35,43 @@ from keras_hub.src.utils.tensor_utils import preprocessing_function
     "keras_hub.models.Qwen3OmniCausalLMPreprocessor",
 )
 class Qwen3OmniCausalLMPreprocessor(CausalLMPreprocessor):
-    """Multimodal preprocessor for Qwen3-Omni CausalLM.
+    """Qwen3-Omni causal LM preprocessor with vision and audio support.
 
-    Handles preprocessing for text, audio, image, and video inputs.
+    For text-only usage this preprocessor behaves identically to the
+    base ``CausalLMPreprocessor``. When converters are attached and the
+    user supplies multimodal inputs as a dict, this preprocessor:
+
+    1. Converts images, videos, and audio to feature tensors via the
+       attached converters.
+    2. Replaces ``<|image_pad|>`` / ``<|video_pad|>`` / ``<|audio_pad|>``
+       placeholder tokens in the text with the correct number of
+       repeated placeholders (one per visual / audio token produced by
+       the corresponding encoder).
+    3. Computes flat ``vision_indices`` and ``audio_indices`` describing
+       where the encoder outputs should be scattered into the text
+       embedding sequence.
+
+    The resulting dict matches the functional graph of
+    ``Qwen3OmniBackbone`` (text + vision + audio inputs) so it can flow
+    through ``model.fit``, ``model.predict``, ``model.generate``, or
+    ``Qwen3OmniCausalLM.score`` without further reshaping.
 
     Args:
-        tokenizer: Qwen3OmniTokenizer instance.
-        audio_converter: Qwen3OmniAudioConverter instance (optional).
-        image_converter: Qwen3OmniImageConverter instance (optional).
-        video_converter: Qwen3OmniVideoConverter instance (optional).
-        sequence_length: int. Maximum sequence length. Defaults to 1024.
-        add_start_token: bool. Whether to add start token. Defaults to True.
-        add_end_token: bool. Whether to add end token. Defaults to True.
-        **kwargs: Additional layer arguments.
-
-    Examples:
-    ```python
-    # Text-only preprocessing
-    preprocessor = keras_hub.models.Qwen3OmniCausalLMPreprocessor.from_preset(
-        "qwen3_omni_instruct"
-    )
-    x = {"prompts": "Hello", "responses": "Hi there!"}
-    output = preprocessor(x)
-
-    # Multimodal preprocessing
-    x = {
-        "prompts": "What is in this image?",
-        "responses": "A cat",
-        "images": image_array,
-        "audio": audio_array,
-        "video": video_frames_array,
-    }
-    output = preprocessor(x)
-    ```
+        tokenizer: A ``Qwen3OmniTokenizer`` instance. Special-token IDs
+            (``image_token_id``, ``video_token_id``, etc.) are resolved
+            from the tokenizer.
+        audio_converter: A ``Qwen3OmniAudioConverter`` instance, or
+            ``None``.
+        image_converter: A ``Qwen3OmniImageConverter`` instance, or
+            ``None``.
+        video_converter: A ``Qwen3OmniVideoConverter`` instance, or
+            ``None``.
+        sequence_length: int. Total padded sequence length. Default
+            1024.
+        add_start_token: bool. Whether to prepend the start token.
+            Default ``True``.
+        add_end_token: bool. Whether to append the end token. Default
+            ``True``.
     """
 
     backbone_cls = Qwen3OmniBackbone
@@ -68,6 +79,18 @@ class Qwen3OmniCausalLMPreprocessor(CausalLMPreprocessor):
     audio_converter_cls = Qwen3OmniAudioConverter
     image_converter_cls = Qwen3OmniImageConverter
     video_converter_cls = Qwen3OmniVideoConverter
+
+    _SPECIAL_TOKEN_ATTRS = [
+        "im_start_token",
+        "end_token",
+        "vision_start_token",
+        "vision_end_token",
+        "image_token",
+        "video_token",
+        "audio_start_token",
+        "audio_end_token",
+        "audio_token",
+    ]
 
     def __init__(
         self,
@@ -91,12 +114,72 @@ class Qwen3OmniCausalLMPreprocessor(CausalLMPreprocessor):
         self.image_converter = image_converter
         self.video_converter = video_converter
 
+        self._cached_special_token_map = None
+        self._cached_special_token_pattern = None
+
+    @property
+    def image_token_id(self):
+        return getattr(self.tokenizer, "image_token_id", None)
+
+    @property
+    def video_token_id(self):
+        return getattr(self.tokenizer, "video_token_id", None)
+
+    @property
+    def audio_token_id(self):
+        return getattr(self.tokenizer, "audio_token_id", None)
+
+    @property
+    def image_token(self):
+        return getattr(self.tokenizer, "image_token", None)
+
+    @property
+    def video_token(self):
+        return getattr(self.tokenizer, "video_token", None)
+
+    @property
+    def audio_token(self):
+        return getattr(self.tokenizer, "audio_token", None)
+
+    @property
+    def _special_token_map(self):
+        """Lazily resolve a ``token_string -> token_id`` map.
+
+        We read special tokens from the attached tokenizer so that
+        callers cannot accidentally desync the IDs between tokenizer
+        and preprocessor.
+        """
+        if self._cached_special_token_map is None:
+            self._cached_special_token_map = {}
+            for attr in self._SPECIAL_TOKEN_ATTRS:
+                tok_str = getattr(self.tokenizer, attr, None)
+                tok_id = getattr(self.tokenizer, f"{attr}_id", None)
+                if tok_str is not None and tok_id is not None:
+                    self._cached_special_token_map[tok_str] = tok_id
+        return self._cached_special_token_map
+
+    @property
+    def _special_token_pattern(self):
+        if self._cached_special_token_pattern is None:
+            mapping = self._special_token_map
+            if not mapping:
+                self._cached_special_token_pattern = re.compile(r"$^")
+            else:
+                self._cached_special_token_pattern = re.compile(
+                    "(" + "|".join(re.escape(t) for t in mapping) + ")"
+                )
+        return self._cached_special_token_pattern
+
     def build(self, input_shape):
-        # Defer packer creation to `build()` so that we can be sure tokenizer
-        # assets have loaded when restoring a saved model.
         super().build(input_shape)
+        start_value = []
+        if (
+            self.add_start_token
+            and getattr(self.tokenizer, "im_start_token_id", None) is not None
+        ):
+            start_value = [self.tokenizer.im_start_token_id]
         self.multi_packer = MultiSegmentPacker(
-            start_value=self.tokenizer.start_token_id or [],
+            start_value=start_value,
             end_value=self.tokenizer.end_token_id or [],
             pad_value=self.tokenizer.pad_token_id,
             sep_value=[],
@@ -104,52 +187,191 @@ class Qwen3OmniCausalLMPreprocessor(CausalLMPreprocessor):
         )
 
     def _process_multimodal_inputs(self, x):
-        """Extract and convert audio, image, and video inputs from a dict.
+        """Run modality-specific converters on a sample dict.
 
-        Image and video patches/grids are concatenated along the visual
-        axis — the backbone's ``_masked_scatter`` uses a combined
-        image+video token mask and the vision encoder handles both in
-        one pass.
+        Returns a tuple of per-modality outputs. Image and video
+        outputs are kept separate (their grids and pixel buffers are
+        not concatenated) because the text token placeholders, the
+        encoder calls, and the M-RoPE positions all require the per-
+        modality identity to be preserved.
         """
         audio_features = None
-        if "audio" in x and self.audio_converter:
+        if "audio" in x and self.audio_converter is not None:
             audio_features = self.audio_converter(x["audio"])
 
         image_out = None
-        if "images" in x and self.image_converter:
+        if "images" in x and self.image_converter is not None:
             image_out = self.image_converter(x["images"])
+
         video_out = None
-        if "video" in x and self.video_converter:
+        if "video" in x and self.video_converter is not None:
             video_out = self.video_converter(x["video"])
 
-        pixel_values = None
-        grid_thw = None
-        if image_out is not None and video_out is not None:
-            pixel_values = ops.concatenate(
-                [image_out["patches"], video_out["patches"]], axis=0
-            )
-            grid_thw = ops.stack(
-                [image_out["grid_thw"], video_out["grid_thw"]], axis=0
-            )
-        elif image_out is not None:
-            pixel_values = image_out["patches"]
-            grid_thw = ops.expand_dims(image_out["grid_thw"], axis=0)
-        elif video_out is not None:
-            pixel_values = video_out["patches"]
-            grid_thw = ops.expand_dims(video_out["grid_thw"], axis=0)
+        return audio_features, image_out, video_out
 
-        return audio_features, pixel_values, grid_thw
+    def _spatial_merge_size(self):
+        """Resolve the spatial merge factor from the attached converter."""
+        return getattr(
+            self.image_converter or self.video_converter,
+            "spatial_merge_size",
+            2,
+        )
+
+    def _num_image_tokens(self, image_grid_thw):
+        """Return per-image visual token counts."""
+        if image_grid_thw is None:
+            return []
+        merge = self._spatial_merge_size()
+        grid_np = (
+            image_grid_thw.numpy()
+            if hasattr(image_grid_thw, "numpy")
+            else np.asarray(image_grid_thw)
+        )
+        if grid_np.ndim == 1:
+            grid_np = grid_np[None, :]
+        return [
+            int(grid_np[i, 0])
+            * (int(grid_np[i, 1]) // merge)
+            * (int(grid_np[i, 2]) // merge)
+            for i in range(grid_np.shape[0])
+        ]
+
+    def _num_audio_tokens(self, audio_features):
+        """Return per-audio post-CNN token counts.
+
+        ``audio_features`` is expected to be ``(num_audios, time,
+        num_mel_bins)`` from the converter; we treat the time axis as
+        the input length to the encoder downsampler.
+        """
+        if audio_features is None:
+            return []
+        feat_np = (
+            audio_features.numpy()
+            if hasattr(audio_features, "numpy")
+            else np.asarray(audio_features)
+        )
+        if feat_np.ndim == 2:
+            feat_np = feat_np[None, ...]
+        counts = []
+        for i in range(feat_np.shape[0]):
+            time_len = int(feat_np[i].shape[0])
+            counts.append(int(_get_feat_extract_output_length(time_len)))
+        return counts
+
+    def _tokenize_with_special_tokens(
+        self,
+        text,
+        num_image_tokens,
+        num_video_tokens,
+        num_audio_tokens,
+    ):
+        """Tokenize ``text`` while expanding multimodal placeholders.
+
+        The BPE tokenizer may decompose multi-codepoint specials into
+        sub-pieces, which would corrupt the placeholder count. To avoid
+        that, we split the input by every known special token, tokenize
+        only the surrounding text segments, and emit special-token IDs
+        directly. Image / video / audio placeholders are repeated by
+        their per-instance count.
+        """
+        parts = self._special_token_pattern.split(text)
+        token_map = self._special_token_map
+        image_token = self.image_token
+        video_token = self.video_token
+        audio_token = self.audio_token
+
+        all_ids = []
+        img_idx = vid_idx = aud_idx = 0
+        for part in parts:
+            if not part:
+                continue
+            if part in token_map:
+                if image_token is not None and part == image_token:
+                    n = (
+                        num_image_tokens[img_idx]
+                        if img_idx < len(num_image_tokens)
+                        else 1
+                    )
+                    img_idx += 1
+                    all_ids.extend([token_map[part]] * n)
+                elif video_token is not None and part == video_token:
+                    n = (
+                        num_video_tokens[vid_idx]
+                        if vid_idx < len(num_video_tokens)
+                        else 1
+                    )
+                    vid_idx += 1
+                    all_ids.extend([token_map[part]] * n)
+                elif audio_token is not None and part == audio_token:
+                    n = (
+                        num_audio_tokens[aud_idx]
+                        if aud_idx < len(num_audio_tokens)
+                        else 1
+                    )
+                    aud_idx += 1
+                    all_ids.extend([token_map[part]] * n)
+                else:
+                    all_ids.append(token_map[part])
+            else:
+                tokenized = self.tokenizer(part)
+                if hasattr(tokenized, "numpy"):
+                    all_ids.extend(tokenized.numpy().tolist())
+                else:
+                    all_ids.extend(list(tokenized))
+        return all_ids
+
+    def _compute_indices(self, token_ids, target_token_ids):
+        """Return flat int32 indices into ``(batch * seq_len)`` matching
+        any of ``target_token_ids``.
+
+        Returns an empty tensor when ``target_token_ids`` is empty or
+        when no positions match. The output is a 1-D tensor (the
+        functional graph reshapes per-batch shapes as needed).
+        """
+        if not target_token_ids:
+            return tf.zeros((0,), dtype="int32")
+        token_ids_np = ops.convert_to_numpy(token_ids).reshape(-1)
+        mask = np.zeros_like(token_ids_np, dtype=bool)
+        for tid in target_token_ids:
+            if tid is None:
+                continue
+            mask |= token_ids_np == tid
+        return tf.constant(np.where(mask)[0].astype(np.int32))
+
+    def _flatten_prompts(self, prompts):
+        """Flatten a string / Tensor / list of prompts to a list of str."""
+        if isinstance(prompts, str):
+            return [prompts], False
+        if isinstance(prompts, tf.Tensor):
+            if len(prompts.shape) == 0:
+                return [prompts.numpy().decode("utf-8")], False
+            return [p.numpy().decode("utf-8") for p in prompts], True
+        if isinstance(prompts, (list, tuple)):
+            return [
+                p.numpy().decode("utf-8") if hasattr(p, "numpy") else str(p)
+                for p in prompts
+            ], True
+        return [str(prompts)], False
 
     def _add_multimodal_to_output(
-        self, output, audio_features, pixel_values, grid_thw
+        self,
+        output,
+        audio_features,
+        audio_indices,
+        image_pixel_values,
+        image_grid_thw,
+        vision_indices,
     ):
-        """Attach multimodal features to the output dict if present."""
         if audio_features is not None:
             output["audio_features"] = audio_features
-        if pixel_values is not None:
-            output["pixel_values"] = pixel_values
-        if grid_thw is not None:
-            output["grid_thw"] = grid_thw
+        if audio_indices is not None:
+            output["audio_indices"] = audio_indices
+        if image_pixel_values is not None:
+            output["pixel_values"] = image_pixel_values
+        if image_grid_thw is not None:
+            output["image_grid_thw"] = image_grid_thw
+        if vision_indices is not None:
+            output["vision_indices"] = vision_indices
 
     @preprocessing_function
     def call(
@@ -161,7 +383,7 @@ class Qwen3OmniCausalLMPreprocessor(CausalLMPreprocessor):
     ):
         sequence_length = sequence_length or self.sequence_length
 
-        # Text-only input (string or tensor)
+        # Text-only fast path for non-dict inputs.
         if not isinstance(x, dict):
             x = self.tokenizer(x)
             token_ids, padding_mask = self.packer(
@@ -177,40 +399,56 @@ class Qwen3OmniCausalLMPreprocessor(CausalLMPreprocessor):
             y, sample_weight = token_ids[..., 1:], padding_mask[..., 1:]
             return keras.utils.pack_x_y_sample_weight(x, y, sample_weight)
 
-        # Multimodal dict input
-        prompts = self.tokenizer(x["prompts"])
-        audio_features, pixel_values, grid_thw = (
-            self._process_multimodal_inputs(x)
-        )
+        # Multimodal dict input.
+        prompts, _ = self._flatten_prompts(x["prompts"])
         responses_text = x.get("responses", None)
+        audio_features, image_out, video_out = self._process_multimodal_inputs(
+            x
+        )
+
+        image_grid_thw = (
+            image_out["grid_thw"] if image_out is not None else None
+        )
+        video_grid_thw = (
+            video_out["grid_thw"] if video_out is not None else None
+        )
+        num_image_tokens = self._num_image_tokens(image_grid_thw)
+        num_video_tokens = self._num_image_tokens(video_grid_thw)
+        num_audio_tokens = self._num_audio_tokens(audio_features)
+
+        prompt_ids = [
+            self._tokenize_with_special_tokens(
+                p, num_image_tokens, num_video_tokens, num_audio_tokens
+            )
+            for p in prompts
+        ]
 
         if responses_text is not None:
-            responses = self.tokenizer(responses_text)
-            # Pack prompt + response with one extra token for label shift.
+            responses, _ = self._flatten_prompts(responses_text)
+            response_ids = [
+                self._tokenize_with_special_tokens(r, [], [], [])
+                for r in responses
+            ]
+            prompt_ragged = tf.ragged.constant(prompt_ids, dtype="int32")
+            response_ragged = tf.ragged.constant(response_ids, dtype="int32")
             token_ids, segment_ids = self.multi_packer(
-                (prompts, responses),
+                (prompt_ragged, response_ragged),
                 sequence_length=sequence_length + 1,
                 add_start_value=self.add_start_token,
                 add_end_value=self.add_end_token,
             )
             padding_mask = token_ids != self.tokenizer.pad_token_id
             response_mask = segment_ids == 1
-
-            # Truncate last token (no next-token target for it).
             x = {
                 "token_ids": token_ids[..., :-1],
                 "padding_mask": padding_mask[..., :-1],
             }
-            self._add_multimodal_to_output(
-                x, audio_features, pixel_values, grid_thw
-            )
-
             y = token_ids[..., 1:]
             sample_weight = response_mask[..., 1:]
         else:
-            # No responses — single-segment next-token prediction.
+            ragged = tf.ragged.constant(prompt_ids, dtype="int32")
             token_ids, padding_mask = self.packer(
-                prompts,
+                ragged,
                 sequence_length=sequence_length + 1,
                 add_start_value=self.add_start_token,
                 add_end_value=self.add_end_token,
@@ -219,12 +457,28 @@ class Qwen3OmniCausalLMPreprocessor(CausalLMPreprocessor):
                 "token_ids": token_ids[..., :-1],
                 "padding_mask": padding_mask[..., :-1],
             }
-            self._add_multimodal_to_output(
-                x, audio_features, pixel_values, grid_thw
-            )
-
             y, sample_weight = token_ids[..., 1:], padding_mask[..., 1:]
 
+        # Compute flat indices for vision + audio scatter inputs.
+        vision_indices = self._compute_indices(
+            x["token_ids"],
+            [self.image_token_id, self.video_token_id],
+        )
+        audio_indices = self._compute_indices(
+            x["token_ids"], [self.audio_token_id]
+        )
+
+        image_pixel_values = (
+            image_out["patches"] if image_out is not None else None
+        )
+        self._add_multimodal_to_output(
+            x,
+            audio_features,
+            audio_indices,
+            image_pixel_values,
+            image_grid_thw,
+            vision_indices,
+        )
         return keras.utils.pack_x_y_sample_weight(x, y, sample_weight)
 
     @preprocessing_function
@@ -233,51 +487,62 @@ class Qwen3OmniCausalLMPreprocessor(CausalLMPreprocessor):
         x,
         sequence_length=None,
     ):
-        """Convert inputs to integer token input for generation.
-
-        Unlike calling the layer for training, this method does not compute
-        labels and will never append a `tokenizer.end_token_id` to the end of
-        the sequence (as generation is expected to continue at the end of the
-        inputted prompt).
-        """
         if not self.built:
             self.build(None)
 
-        # Text-only input (string or tensor)
         if not isinstance(x, dict):
             x = self.tokenizer(x)
             token_ids, padding_mask = self.packer(
                 x, sequence_length=sequence_length, add_end_value=False
             )
-            return {
-                "token_ids": token_ids,
-                "padding_mask": padding_mask,
-            }
+            return {"token_ids": token_ids, "padding_mask": padding_mask}
 
-        # Multimodal dict input
-        prompts = self.tokenizer(x["prompts"])
-        audio_features, pixel_values, grid_thw = (
-            self._process_multimodal_inputs(x)
+        prompts, _ = self._flatten_prompts(x["prompts"])
+        audio_features, image_out, video_out = self._process_multimodal_inputs(
+            x
         )
+        image_grid_thw = (
+            image_out["grid_thw"] if image_out is not None else None
+        )
+        video_grid_thw = (
+            video_out["grid_thw"] if video_out is not None else None
+        )
+        num_image_tokens = self._num_image_tokens(image_grid_thw)
+        num_video_tokens = self._num_image_tokens(video_grid_thw)
+        num_audio_tokens = self._num_audio_tokens(audio_features)
 
-        if "responses" in x:
-            segments = (prompts, self.tokenizer(x["responses"]))
-        else:
-            segments = (prompts,)
-
-        token_ids, segment_ids = self.multi_packer(
-            segments,
+        prompt_ids = [
+            self._tokenize_with_special_tokens(
+                p, num_image_tokens, num_video_tokens, num_audio_tokens
+            )
+            for p in prompts
+        ]
+        ragged = tf.ragged.constant(prompt_ids, dtype="int32")
+        token_ids, padding_mask = self.packer(
+            ragged,
             sequence_length=sequence_length,
             add_start_value=self.add_start_token,
             add_end_value=False,
         )
-        padding_mask = token_ids != self.tokenizer.pad_token_id
 
+        vision_indices = self._compute_indices(
+            token_ids, [self.image_token_id, self.video_token_id]
+        )
+        audio_indices = self._compute_indices(token_ids, [self.audio_token_id])
+
+        image_pixel_values = (
+            image_out["patches"] if image_out is not None else None
+        )
         result = {
             "token_ids": token_ids,
             "padding_mask": padding_mask,
         }
         self._add_multimodal_to_output(
-            result, audio_features, pixel_values, grid_thw
+            result,
+            audio_features,
+            audio_indices,
+            image_pixel_values,
+            image_grid_thw,
+            vision_indices,
         )
         return result

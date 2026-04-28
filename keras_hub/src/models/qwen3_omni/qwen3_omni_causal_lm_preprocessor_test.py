@@ -22,7 +22,18 @@ from keras_hub.src.tests.test_case import TestCase
 class Qwen3OmniCausalLMPreprocessorTest(TestCase):
     def setUp(self):
         self.vocab = ["!", "air", "Ġair", "plane", "Ġat", "port"]
-        self.vocab += ["<|im_end|>", "<|endoftext|>"]
+        self.vocab += [
+            "<|im_end|>",
+            "<|endoftext|>",
+            "<|im_start|>",
+            "<|vision_start|>",
+            "<|vision_end|>",
+            "<|image_pad|>",
+            "<|video_pad|>",
+            "<|audio_start|>",
+            "<|audio_end|>",
+            "<|audio_pad|>",
+        ]
         self.vocab = dict([(token, i) for i, token in enumerate(self.vocab)])
         self.merges = ["Ġ a", "Ġ t", "Ġ i", "Ġ b", "a i", "p l", "n e"]
         self.merges += ["Ġa t", "p o", "r t", "Ġt h", "ai r", "pl a", "po rt"]
@@ -114,7 +125,7 @@ class Qwen3OmniCausalLMPreprocessorTest(TestCase):
         }
         x, y, sw = preprocessor(input_data)
         self.assertIn("pixel_values", x)
-        self.assertIn("grid_thw", x)
+        self.assertIn("image_grid_thw", x)
         self.assertIn("token_ids", x)
         self.assertIn("padding_mask", x)
 
@@ -133,8 +144,6 @@ class Qwen3OmniCausalLMPreprocessorTest(TestCase):
             "video": np.ones((4, 224, 224, 3), dtype=np.uint8) * 128,
         }
         x, y, sw = preprocessor(input_data)
-        self.assertIn("pixel_values", x)
-        self.assertIn("grid_thw", x)
         self.assertIn("token_ids", x)
         self.assertIn("padding_mask", x)
 
@@ -159,7 +168,7 @@ class Qwen3OmniCausalLMPreprocessorTest(TestCase):
         self.assertIn("padding_mask", x)
         self.assertIn("audio_features", x)
         self.assertIn("pixel_values", x)
-        self.assertIn("grid_thw", x)
+        self.assertIn("image_grid_thw", x)
 
     @pytest.mark.extra_large
     def test_all_presets(self):

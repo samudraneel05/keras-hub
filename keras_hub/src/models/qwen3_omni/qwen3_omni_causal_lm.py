@@ -1,4 +1,5 @@
 import keras
+import numpy as np
 from keras import ops
 
 from keras_hub.src.api_export import keras_hub_export
@@ -6,107 +7,26 @@ from keras_hub.src.models.causal_lm import CausalLM
 from keras_hub.src.models.qwen3_omni.qwen3_omni_backbone import (
     Qwen3OmniBackbone,
 )
+from keras_hub.src.models.qwen3_omni.qwen3_omni_backbone import (
+    _vision_indices_to_mask,
+)
 from keras_hub.src.models.qwen3_omni.qwen3_omni_causal_lm_preprocessor import (
     Qwen3OmniCausalLMPreprocessor,
 )
 from keras_hub.src.utils.tensor_utils import any_equal
 
 
-@keras_hub_export(
-    "keras_hub.models.Qwen3OmniCausalLM",
-)
+@keras_hub_export("keras_hub.models.Qwen3OmniCausalLM")
 class Qwen3OmniCausalLM(CausalLM):
-    """An end-to-end Qwen3-Omni model for causal language modeling.
+    """End-to-end Qwen3-Omni model for causal language modeling.
 
-    A causal language model (LM) predicts the next token based on previous
-    tokens. This task setup can be used to train the model unsupervised on plain
-    text input, or to autoregressively generate plain text similar to the data
-    used for training. This task can be used for pre-training or fine-tuning a
-    Qwen3-Omni model, simply by calling `fit()`.
-
-    This model has a `generate()` method, which generates text based on a
-    prompt. The generation strategy used is controlled by an additional
-    `sampler` argument on `compile()`. You can recompile the model with
-    different `keras_hub.samplers` objects to control the generation.
-    By default, `"greedy"` sampling will be used.
-
-    This model can optionally be configured with a `preprocessor` layer, in
-    which case it will automatically apply preprocessing to string inputs during
-    `fit()`, `predict()`, `evaluate()`, and `generate()`. This is done by
-    default when creating the model with `from_preset()`.
+    Wraps a ``Qwen3OmniBackbone`` (text + optional vision / audio
+    encoders) with a reverse-embedding LM head, multimodal M-RoPE
+    position-id derivation, and a KV-cached ``generate()`` loop.
 
     Args:
-        backbone: A `keras_hub.models.Qwen3OmniBackbone` instance.
-        preprocessor: A `keras_hub.models.Qwen3OmniCausalLMPreprocessor` or
-            `None`. If `None`, this model will not apply preprocessing, and
-            inputs should be preprocessed before calling the model.
-
-    Examples:
-    TODO: Update once presets registered
-    Use `generate()` to do text generation.
-    ```python
-    qwen3_omni_lm = keras_hub.models.Qwen3OmniCausalLM.from_preset(
-        "hf://Qwen/Qwen3-Omni-30B-A3B-Thinking"
-    )
-    qwen3_omni_lm.generate("I want to say", max_length=30)
-
-    # Generate with batched prompts.
-    qwen3_omni_lm.generate(["This is a", "Where are you"], max_length=30)
-    ```
-
-    Compile the `generate()` function with a custom sampler.
-    ```python
-    qwen3_omni_lm = keras_hub.models.Qwen3OmniCausalLM.from_preset(
-        "hf://Qwen/Qwen3-Omni-30B-A3B-Thinking"
-    )
-    qwen3_omni_lm.compile(sampler="top_k")
-    qwen3_omni_lm.generate("I want to say", max_length=30)
-
-    qwen3_omni_lm.compile(sampler=keras_hub.samplers.BeamSampler(num_beams=2))
-    qwen3_omni_lm.generate("I want to say", max_length=30)
-    ```
-
-    Use `generate()` without preprocessing.
-    ```python
-    prompt = {
-        # Token ids for "<bos> Qwen3 is".
-        "token_ids": np.array([[2, 12345, 678, 0, 0, 0, 0]] * 2),
-        # Use `"padding_mask"` to indicate values that should not be overridden.
-        "padding_mask": np.array([[1, 1, 1, 0, 0, 0, 0]] * 2),
-    }
-
-    qwen3_omni_lm = keras_hub.models.Qwen3OmniCausalLM.from_preset(
-        "hf://Qwen/Qwen3-Omni-30B-A3B-Thinking",
-        preprocessor=None,
-    )
-    qwen3_omni_lm.generate(prompt)
-    ```
-
-    Call `fit()` on a single batch.
-    ```python
-    features = ["The quick brown fox jumped.", "I forgot my homework."]
-    qwen3_omni_lm = keras_hub.models.Qwen3OmniCausalLM.from_preset(
-        "hf://Qwen/Qwen3-Omni-30B-A3B-Thinking"
-    )
-    qwen3_omni_lm.fit(x=features, batch_size=2)
-    ```
-
-    Call `fit()` without preprocessing.
-    ```python
-    x = {
-        # Token ids for "<bos> Qwen3 is a language model<eos>"
-        "token_ids": np.array([[2, 12345, 678, 543, 9876, 1, 0, 0]] * 2),
-        "padding_mask": np.array([[1, 1, 1, 1, 1, 1, 0, 0]] * 2),
-    }
-    y = np.array([[12345, 678, 543, 9876, 1, 0, 0, 0]] * 2)
-    sw = np.array([[1, 1, 1, 1, 1, 0, 0, 0]] * 2)
-
-    qwen3_omni_lm = keras_hub.models.Qwen3OmniCausalLM.from_preset(
-        "hf://Qwen/Qwen3-Omni-30B-A3B-Thinking",
-        preprocessor=None,
-    )
-    qwen3_omni_lm.fit(x=x, y=y, sample_weight=sw, batch_size=2)
-    ```
+        backbone: A ``Qwen3OmniBackbone`` instance.
+        preprocessor: A ``Qwen3OmniCausalLMPreprocessor`` or ``None``.
     """
 
     backbone_cls = Qwen3OmniBackbone
@@ -141,183 +61,658 @@ class Qwen3OmniCausalLM(CausalLM):
             **kwargs,
         )
 
+    def _get_token_id(self, attr_name):
+        """Return a special-token id from the tokenizer, or ``None``."""
+        tokenizer = getattr(
+            getattr(self, "preprocessor", None), "tokenizer", None
+        )
+        return getattr(tokenizer, attr_name, None) if tokenizer else None
+
+    def _compute_initial_embeddings(
+        self,
+        token_ids,
+        audio_features=None,
+        audio_indices=None,
+        pixel_values=None,
+        image_grid_thw=None,
+        vision_indices=None,
+    ):
+        """Build initial embeddings, scattering vision / audio features
+        into the text sequence and returning the DeepStack metadata."""
+        text_embeds = self.backbone.token_embedding(token_ids)
+        backbone = self.backbone
+
+        vision_embeds, deepstack_features = None, None
+        if pixel_values is not None and getattr(backbone, "has_vision", False):
+            out = backbone.vision_encoder(
+                {"pixel_values": pixel_values, "grid_thw": image_grid_thw}
+            )
+            vision_embeds = out["pooler_output"]
+            deepstack_features = out.get("deepstack_features")
+
+        audio_embeds = None
+        if audio_features is not None and getattr(backbone, "has_audio", False):
+            audio_embeds = backbone.audio_encoder(
+                {"input_features": audio_features}
+            )
+
+        if getattr(backbone, "is_multimodal", False) and (
+            vision_embeds is not None or audio_embeds is not None
+        ):
+            x = backbone.interleave_embeddings(
+                text_embeddings=text_embeds,
+                vision_embeddings=vision_embeds,
+                vision_indices=vision_indices,
+                audio_embeddings=audio_embeds,
+                audio_indices=audio_indices,
+            )
+        else:
+            x = text_embeds
+
+        visual_pos_mask = (
+            _vision_indices_to_mask(vision_indices, x)
+            if vision_indices is not None and deepstack_features is not None
+            else None
+        )
+        return x, deepstack_features, visual_pos_mask
+
+    def compute_multimodal_rope_index(
+        self,
+        token_ids,
+        image_grid_thw=None,
+        video_grid_thw=None,
+        audio_seqlens=None,
+        second_per_grids=None,
+        attention_mask=None,
+        use_audio_in_video=False,
+        image_token_id=None,
+        video_token_id=None,
+        audio_token_id=None,
+        vision_start_token_id=None,
+        audio_start_token_id=None,
+    ):
+        """Compute 3D M-RoPE position IDs for a batch of prompts.
+
+        Vision tokens get ``(temporal, height, width)`` indices on a
+        ``spatial_merge_size``-reduced grid; audio tokens advance all
+        three channels in lock-step (one slot per compressed audio
+        frame); text tokens broadcast a scalar position. Trailing text
+        continues from ``max(previous_position) + 1``. With
+        ``use_audio_in_video=True`` and a
+        ``<vision_start><audio_start>`` prefix, video and audio
+        per-step positions are merged in temporal-channel order
+        (``bos_len = eos_len = 2``).
+
+        Args:
+            token_ids: int array. ``(batch, seq)`` prompt tokens.
+            image_grid_thw: int array or None. ``(num_images, 3)``
+                ``(t, h, w)`` grid dims in patch units for each image.
+            video_grid_thw: int array or None. ``(num_videos, 3)``
+                grid dims for each video.
+            audio_seqlens: int array or None. ``(num_audios,)`` raw
+                audio frame counts (pre-encoder).
+            second_per_grids: float array or None. ``(num_videos,)``
+                seconds-per-grid-step used to scale temporal positions.
+            attention_mask: int array or None. ``(batch, seq)``;
+                defaults to all ones.
+            use_audio_in_video: bool. Interleave audio and video
+                positions when a ``<vision_start><audio_start>`` prefix
+                is present.
+            image_token_id, video_token_id, audio_token_id,
+            vision_start_token_id, audio_start_token_id: int or None.
+                Override the tokenizer's default special-token ids.
+
+        Returns:
+            Tuple ``(position_ids, deltas)`` of ``int64`` arrays with
+            shapes ``(3, batch, seq)`` and ``(batch,)``. Channels
+            ``0/1/2`` feed the temporal / height / width M-RoPE
+            sub-bands; ``deltas`` is the per-batch offset between the
+            max M-RoPE position and the trailing-text cursor.
+        """
+        token_ids = np.asarray(token_ids, dtype=np.int64)
+        if token_ids.ndim != 2:
+            raise ValueError(
+                f"token_ids must be 2-D (batch, seq); got {token_ids.shape}"
+            )
+        batch_size, seq_len = token_ids.shape
+
+        attn_bool = (
+            (np.asarray(attention_mask, dtype=np.int64) == 1)
+            if attention_mask is not None
+            else np.ones_like(token_ids, dtype=bool)
+        )
+
+        # Resolve special-token IDs from the tokenizer when not given.
+        image_token_id = image_token_id or self._get_token_id("image_token_id")
+        video_token_id = video_token_id or self._get_token_id("video_token_id")
+        audio_token_id = audio_token_id or self._get_token_id("audio_token_id")
+        vision_start_token_id = vision_start_token_id or self._get_token_id(
+            "vision_start_token_id"
+        )
+        audio_start_token_id = audio_start_token_id or self._get_token_id(
+            "audio_start_token_id"
+        )
+
+        position_id_per_seconds = self.backbone.position_id_per_seconds
+        spatial_merge_size = getattr(
+            self.backbone.vision_encoder, "spatial_merge_size", 2
+        )
+
+        from keras_hub.src.models.qwen3_omni.qwen3_omni_audio_encoder import (
+            _get_feat_extract_output_length,
+        )
+
+        def _to_np(arr, dtype):
+            if arr is None:
+                return None
+            arr = np.asarray(arr, dtype=dtype)
+            return None if arr.size == 0 else arr
+
+        image_grid_thw = _to_np(image_grid_thw, np.int64)
+        video_grid_thw = _to_np(video_grid_thw, np.int64)
+        audio_seqlens = _to_np(audio_seqlens, np.int64)
+        second_per_grids = _to_np(second_per_grids, np.float64)
+
+        # Text-only fallback: cumsum-based positions broadcast to 3 channels.
+        if (
+            image_grid_thw is None
+            and video_grid_thw is None
+            and audio_seqlens is None
+        ):
+            cumulative = np.cumsum(attn_bool.astype(np.int64), -1) - 1
+            cumulative = np.where(
+                attn_bool, cumulative, np.ones_like(cumulative)
+            )
+            position_ids = np.broadcast_to(
+                cumulative[None], (3, batch_size, seq_len)
+            ).copy()
+            deltas = (
+                position_ids.max(axis=0).max(axis=-1)
+                + 1
+                - attn_bool.sum(axis=-1)
+            )
+            return position_ids.astype(np.int64), deltas.astype(np.int64)
+
+        position_ids = np.zeros((3, batch_size, seq_len), dtype=np.int64)
+        deltas = np.zeros((batch_size,), dtype=np.int64)
+        image_idx = video_idx = audio_idx = 0
+
+        def _vision_pos(start_idx, vision_idx, t_index, grid_hs, grid_ws):
+            """``(3, T*llm_h*llm_w)`` M-RoPE positions for one vision clip."""
+            llm_h = int(grid_hs[vision_idx]) // spatial_merge_size
+            llm_w = int(grid_ws[vision_idx]) // spatial_merge_size
+            t_index = np.asarray(t_index, dtype=np.int64)
+            t_rep = np.repeat(t_index, llm_h * llm_w)
+            h_rep = np.tile(
+                np.repeat(np.arange(llm_h, dtype=np.int64), llm_w),
+                len(t_index),
+            )
+            w_rep = np.tile(
+                np.arange(llm_w, dtype=np.int64), len(t_index) * llm_h
+            )
+            return np.stack([t_rep, h_rep, w_rep], axis=0) + start_idx
+
+        def _const(length, start):
+            """``(3, length)`` block holding ``arange(length) + start``."""
+            return (
+                np.broadcast_to(
+                    np.arange(length, dtype=np.int64), (3, length)
+                ).copy()
+                + start
+            )
+
+        def _try_index(needle, start):
+            try:
+                return tokens.index(int(needle), start)
+            except ValueError:
+                return len(tokens) + 1
+
+        for b in range(batch_size):
+            valid = attn_bool[b]
+            row = token_ids[b][valid]
+            tokens = row.tolist()
+            seq_pos_ids = []
+            st = 0
+
+            # Count modality occurrences.
+            vs_idx = (
+                np.where(row == vision_start_token_id)[0]
+                if vision_start_token_id is not None
+                else np.array([], dtype=np.int64)
+            )
+            following = (
+                row[np.minimum(vs_idx + 1, len(row) - 1)]
+                if vs_idx.size
+                else np.array([], dtype=row.dtype)
+            )
+            audio_nums = (
+                int(np.sum(row == audio_start_token_id))
+                if audio_start_token_id is not None
+                else 0
+            )
+            image_nums = (
+                int(np.sum(following == image_token_id))
+                if image_token_id is not None
+                else 0
+            )
+            if use_audio_in_video and audio_start_token_id is not None:
+                video_nums = int(np.sum(following == audio_start_token_id))
+            elif video_token_id is not None:
+                video_nums = int(np.sum(following == video_token_id))
+            else:
+                video_nums = 0
+
+            remain_images, remain_videos, remain_audios = (
+                image_nums,
+                video_nums,
+                audio_nums,
+            )
+            multimodal_nums = (
+                image_nums + audio_nums
+                if use_audio_in_video
+                else image_nums + video_nums + audio_nums
+            )
+
+            for _ in range(multimodal_nums):
+                st_idx = int(seq_pos_ids[-1].max() + 1) if seq_pos_ids else 0
+
+                # Locate the next vision_start / audio_start.
+                ed_vs = (
+                    _try_index(vision_start_token_id, st)
+                    if (
+                        vision_start_token_id is not None
+                        and (remain_videos > 0 or remain_images > 0)
+                        and (
+                            (
+                                image_token_id is not None
+                                and image_token_id in tokens
+                            )
+                            or (
+                                video_token_id is not None
+                                and video_token_id in tokens
+                            )
+                        )
+                    )
+                    else len(tokens) + 1
+                )
+                ed_as = (
+                    _try_index(audio_start_token_id, st)
+                    if (
+                        audio_start_token_id is not None
+                        and audio_token_id is not None
+                        and audio_token_id in tokens
+                        and remain_audios > 0
+                    )
+                    else len(tokens) + 1
+                )
+                min_ed = min(ed_vs, ed_as)
+
+                # Text run preceding the next multimodal marker.
+                text_len = min_ed - st
+                if text_len > 0:
+                    seq_pos_ids.append(_const(text_len, st_idx))
+                    st_idx += text_len
+
+                # BOS / EOS lengths (2 each for audio-in-video, else 1).
+                aiv = (
+                    use_audio_in_video
+                    and min_ed == ed_vs
+                    and ed_vs + 1 == ed_as
+                )
+                bos_len = eos_len = 2 if aiv else 1
+                seq_pos_ids.append(_const(bos_len, st_idx))
+                st_idx += bos_len
+
+                if min_ed == ed_as:
+                    # Audio-only branch.
+                    if audio_seqlens is None:
+                        raise ValueError(
+                            "audio_seqlens required for audio markers."
+                        )
+                    audio_len = int(
+                        _get_feat_extract_output_length(
+                            int(audio_seqlens[audio_idx])
+                        )
+                    )
+                    seq_pos_ids.append(_const(audio_len, st_idx))
+                    st += int(text_len + bos_len + audio_len + eos_len)
+                    audio_idx += 1
+                    remain_audios -= 1
+
+                elif (
+                    min_ed == ed_vs
+                    and image_token_id is not None
+                    and ed_vs + 1 < len(tokens)
+                    and tokens[ed_vs + 1] == image_token_id
+                ):
+                    # Image-only branch.
+                    grid_t = int(image_grid_thw[image_idx][0])
+                    t_index = (
+                        np.arange(grid_t, dtype=np.int64)
+                        * position_id_per_seconds
+                    )
+                    seq_pos_ids.append(
+                        _vision_pos(
+                            st_idx,
+                            image_idx,
+                            t_index,
+                            image_grid_thw[:, 1],
+                            image_grid_thw[:, 2],
+                        )
+                    )
+                    image_len = int(
+                        np.prod(image_grid_thw[image_idx])
+                        // (spatial_merge_size**2)
+                    )
+                    st += int(text_len + bos_len + image_len + eos_len)
+                    image_idx += 1
+                    remain_images -= 1
+
+                elif (
+                    min_ed == ed_vs
+                    and not use_audio_in_video
+                    and video_token_id is not None
+                    and ed_vs + 1 < len(tokens)
+                    and tokens[ed_vs + 1] == video_token_id
+                ):
+                    # Video-only branch.
+                    if video_grid_thw is None or second_per_grids is None:
+                        raise ValueError(
+                            "video_grid_thw and second_per_grids required"
+                            " for video markers."
+                        )
+                    grid_t = int(video_grid_thw[video_idx][0])
+                    t_index = (
+                        np.arange(grid_t, dtype=np.float64)
+                        * float(second_per_grids[video_idx])
+                        * position_id_per_seconds
+                    ).astype(np.int64)
+                    seq_pos_ids.append(
+                        _vision_pos(
+                            st_idx,
+                            video_idx,
+                            t_index,
+                            video_grid_thw[:, 1],
+                            video_grid_thw[:, 2],
+                        )
+                    )
+                    video_len = int(
+                        np.prod(video_grid_thw[video_idx])
+                        // (spatial_merge_size**2)
+                    )
+                    st += int(text_len + bos_len + video_len + eos_len)
+                    video_idx += 1
+                    remain_videos -= 1
+
+                elif aiv:
+                    # Audio-in-Video (interleaved).
+                    if (
+                        video_grid_thw is None
+                        or second_per_grids is None
+                        or audio_seqlens is None
+                    ):
+                        raise ValueError(
+                            "video_grid_thw, second_per_grids, and"
+                            " audio_seqlens required for use_audio_in_video."
+                        )
+                    audio_len = int(
+                        _get_feat_extract_output_length(
+                            int(audio_seqlens[audio_idx])
+                        )
+                    )
+                    audio_pos = _const(audio_len, st_idx)
+                    grid_t = int(video_grid_thw[video_idx][0])
+                    t_index = (
+                        np.arange(grid_t, dtype=np.float64)
+                        * float(second_per_grids[video_idx])
+                        * position_id_per_seconds
+                    ).astype(np.int64)
+                    video_pos = _vision_pos(
+                        st_idx,
+                        video_idx,
+                        t_index,
+                        video_grid_thw[:, 1],
+                        video_grid_thw[:, 2],
+                    )
+                    # Merge sorted by temporal channel.
+                    v, a = 0, 0
+                    while v < video_pos.shape[-1] and a < audio_pos.shape[-1]:
+                        if video_pos[0][v] <= audio_pos[0][a]:
+                            seq_pos_ids.append(video_pos[:, v : v + 1])
+                            v += 1
+                        else:
+                            seq_pos_ids.append(audio_pos[:, a : a + 1])
+                            a += 1
+                    if v < video_pos.shape[-1]:
+                        seq_pos_ids.append(video_pos[:, v:])
+                    if a < audio_pos.shape[-1]:
+                        seq_pos_ids.append(audio_pos[:, a:])
+                    video_len = int(
+                        np.prod(video_grid_thw[video_idx])
+                        // (spatial_merge_size**2)
+                    )
+                    st += int(
+                        text_len + bos_len + audio_len + video_len + eos_len
+                    )
+                    audio_idx += 1
+                    video_idx += 1
+                    remain_videos -= 1
+                    remain_audios -= 1
+                else:
+                    break  # Defensive: avoids infinite loop on bad input.
+
+                st_idx = int(seq_pos_ids[-1].max() + 1)
+                seq_pos_ids.append(_const(eos_len, st_idx))
+
+            # Trailing text after the last multimodal block.
+            if st < len(tokens):
+                st_idx = int(seq_pos_ids[-1].max() + 1) if seq_pos_ids else 0
+                seq_pos_ids.append(_const(len(tokens) - st, st_idx))
+
+            flat = (
+                np.concatenate(seq_pos_ids, axis=1)
+                if seq_pos_ids
+                else np.zeros((3, 0), dtype=np.int64)
+            )
+            full = np.zeros((3, seq_len), dtype=np.int64)
+            full[:, valid] = flat
+            position_ids[:, b, :] = full
+            deltas[b] = int(flat.max() + 1 - len(tokens)) if flat.size else 0
+        return position_ids, deltas
+
     def call_with_cache(
         self,
         token_ids,
         cache,
         cache_update_index,
         audio_features=None,
+        audio_indices=None,
         pixel_values=None,
-        grid_thw=None,
+        image_grid_thw=None,
+        vision_indices=None,
+        position_ids=None,
     ):
-        """Forward pass of `Qwen3OmniCausalLM` with cache.
+        """KV-cached forward pass for prompt ingestion and decode.
 
-        `call_with_cache` adds an additional forward pass for the model for
-        autoregressive inference. Unlike calling the model directly, this
-        method allows caching previous key/value Tensors in multi-head
-        attention layer, and avoids recomputing the outputs of seen tokens.
-
-        When ``audio_features`` or ``pixel_values`` is provided, this method
-        runs the audio/vision encoders and scatters their embeddings at the
-        corresponding placeholder positions in ``token_ids``. This is only
-        meaningful on the initial (prompt) pass, and subsequent decode steps
-        produce a single new token whose embedding is read directly from the
-        text token embedding table.
+        On the first call the optional vision / audio encoders run and
+        their outputs are scattered into the text embeddings at
+        ``vision_indices`` / ``audio_indices``. Subsequent decode steps
+        reuse the cache and skip the encoders.
 
         Args:
-            token_ids: dense int Tensor, shape `(batch_size, max_length)`.
-            cache: dense float Tensor, the key/value cache.
-            cache_update_index: int or int Tensor. The index of the current
-                inputs in the full sequence.
-            audio_features: optional float Tensor of log-mel features to
-                inject at audio placeholder positions.
-            pixel_values: optional float Tensor of image/video patches to
-                inject at vision placeholder positions.
-            grid_thw: optional int Tensor describing the patch grid for each
-                image/video fed through ``pixel_values``.
+            token_ids: int tensor. ``(batch, seq)`` current tokens.
+            cache: float tensor. KV cache of shape
+                ``(batch, num_layers, 2, max_len, num_kv_heads,
+                head_dim)``.
+            cache_update_index: int. Position to write the new K/V
+                slice into.
+            audio_features: float tensor or None. Log-mel input.
+            audio_indices: int tensor or None. Flat positions where
+                audio embeddings land in the text sequence.
+            pixel_values: float tensor or None. Image patches.
+            image_grid_thw: int tensor or None. ``(batch, num_images,
+                3)`` grid dims.
+            vision_indices: int tensor or None. Flat positions where
+                vision embeddings land in the text sequence.
+            position_ids: int tensor or None. ``(3, batch, seq)``
+                M-RoPE positions; if ``None`` they are built from
+                ``cache_update_index`` (plus any cached M-RoPE delta)
+                and broadcast to all three channels.
 
         Returns:
-            A `(logits, hidden_states, cache)` tuple.
+            Tuple ``(logits, hidden_states, cache)``. ``logits`` has
+            shape ``(batch, seq, vocab)``, ``hidden_states``
+            ``(batch, seq, hidden_dim)``, and ``cache`` matches the
+            shape of the input cache.
         """
         if audio_features is not None or pixel_values is not None:
             x, deepstack_features, visual_pos_mask = (
-                self.backbone._compute_embeddings(
-                    token_ids, audio_features, pixel_values, grid_thw
+                self._compute_initial_embeddings(
+                    token_ids,
+                    audio_features=audio_features,
+                    audio_indices=audio_indices,
+                    pixel_values=pixel_values,
+                    image_grid_thw=image_grid_thw,
+                    vision_indices=vision_indices,
                 )
             )
         else:
             x = self.backbone.token_embedding(token_ids)
-            deepstack_features = None
-            visual_pos_mask = None
+            deepstack_features = visual_pos_mask = None
 
         batch_size = ops.shape(token_ids)[0]
         seq_len = ops.shape(token_ids)[1]
-        # Build position_ids starting from cache_update_index so that each
-        # token (including single-token decode steps) gets its correct
-        # absolute position.
-        positions = ops.arange(seq_len, dtype="int32") + cache_update_index
-        positions = ops.expand_dims(positions, axis=0)
-        positions = ops.repeat(positions, batch_size, axis=0)
-        position_ids = ops.stack([positions, positions, positions], axis=0)
-        # Each decoder layer has a cache; we update them separately.
+        if position_ids is None:
+            positions = ops.arange(seq_len, dtype="int32") + cache_update_index
+            positions = ops.repeat(
+                ops.expand_dims(positions, 0), batch_size, axis=0
+            )
+            delta = getattr(self, "_mrope_position_deltas", None)
+            if delta is not None:
+                positions = positions + ops.expand_dims(
+                    ops.cast(delta, positions.dtype), axis=1
+                )
+            position_ids = ops.stack([positions] * 3, axis=0)
+
         updated_cache = []
         for i in range(self.backbone.num_layers):
-            current_cache = cache[:, i, ...]
             x, next_cache = self.backbone.transformer_layers[i](
                 x,
                 position_ids=position_ids,
-                cache=current_cache,
+                cache=cache[:, i, ...],
                 cache_update_index=cache_update_index,
             )
             updated_cache.append(next_cache)
-            # DeepStack injection at vision-encoder-specified layers.
-            if deepstack_features is not None and i < len(deepstack_features):
+            if (
+                deepstack_features is not None
+                and visual_pos_mask is not None
+                and i < len(deepstack_features)
+            ):
                 x = self.backbone._deepstack_process(
                     x, visual_pos_mask, deepstack_features[i]
                 )
 
-        # Stack updated caches back into single tensor
         cache = ops.stack(updated_cache, axis=1)
-
-        # Final layer norm and projection to vocabulary
-        hidden_states = x = self.backbone.layer_norm(x)
-        logits = self.backbone.token_embedding(x, reverse=True)
+        hidden_states = self.backbone.layer_norm(x)
+        logits = self.backbone.token_embedding(hidden_states, reverse=True)
         return logits, hidden_states, cache
 
     def _build_cache(
         self,
         token_ids,
         audio_features=None,
+        audio_indices=None,
         pixel_values=None,
-        grid_thw=None,
+        image_grid_thw=None,
+        vision_indices=None,
+        padding_mask=None,
     ):
-        """Initialize KV cache and perform initial forward pass.
+        """Allocate the KV cache and seed it with the prompt forward pass.
 
-        Creates a zero-initialized cache tensor and seeds it with the initial
-        prompt tokens. If multimodal inputs are provided, they are injected
-        into the prompt embeddings before the first forward pass.
-
-        Args:
-            token_ids: Initial prompt tokens, shape
-                `(batch_size, prompt_length)`.
-            audio_features: optional audio features for injection.
-            pixel_values: optional image/video patches for injection.
-            grid_thw: optional patch grid metadata for ``pixel_values``.
-
-        Returns:
-            Tuple of `(hidden_states, cache)` from the initial forward pass.
+        Caches the per-batch M-RoPE delta on ``self`` when an image grid
+        is supplied so trailing-text decode positions stay aligned.
         """
-        # Determine cache dimensions from input and model config
         batch_size = ops.shape(token_ids)[0]
         max_length = ops.shape(token_ids)[1]
-        num_layers = self.backbone.num_layers
-        num_key_value_heads = self.backbone.num_key_value_heads
-        head_dim = self.backbone.head_dim
-        shape = [
-            batch_size,
-            num_layers,
-            2,
-            max_length,
-            num_key_value_heads,
-            head_dim,
-        ]
-        cache = ops.zeros(shape, dtype=self.compute_dtype)
+        cache = ops.zeros(
+            [
+                batch_size,
+                self.backbone.num_layers,
+                2,
+                max_length,
+                self.backbone.num_key_value_heads,
+                self.backbone.head_dim,
+            ],
+            dtype=self.compute_dtype,
+        )
 
-        # Seed cache with initial forward pass
+        position_ids = None
+        self._mrope_position_deltas = None
+        image_token_id = self._get_token_id("image_token_id")
+        if image_grid_thw is not None and image_token_id is not None:
+            pos_np, deltas_np = self.compute_multimodal_rope_index(
+                ops.convert_to_numpy(token_ids),
+                image_grid_thw=ops.convert_to_numpy(image_grid_thw),
+                attention_mask=(
+                    ops.convert_to_numpy(padding_mask)
+                    if padding_mask is not None
+                    else None
+                ),
+            )
+            position_ids = ops.convert_to_tensor(
+                pos_np.astype("int32"), dtype="int32"
+            )
+            self._mrope_position_deltas = ops.convert_to_tensor(
+                deltas_np.astype("int32"), dtype="int32"
+            )
+
         _, hidden_states, cache = self.call_with_cache(
             token_ids,
             cache,
             0,
             audio_features=audio_features,
+            audio_indices=audio_indices,
             pixel_values=pixel_values,
-            grid_thw=grid_thw,
+            image_grid_thw=image_grid_thw,
+            vision_indices=vision_indices,
+            position_ids=position_ids,
         )
         return hidden_states, cache
 
-    def generate_step(
-        self,
-        inputs,
-        stop_token_ids=None,
-    ):
-        """A compilable generation function for a single batch of inputs.
-
-        This function represents the inner, XLA-compilable, generation
-        function for a single batch of inputs. Inputs should have the same
-        structure as model inputs, a dictionary with keys `"token_ids"` and
-        `"padding_mask"`, and optionally `"audio_features"`,
-        `"pixel_values"`, and `"grid_thw"` for multimodal generation.
+    def generate_step(self, inputs, stop_token_ids=None):
+        """Compilable per-batch generation step.
 
         Args:
-            inputs: A dictionary of batched input tensors.
-            stop_token_ids: Tuple of id's of the end token to stop on. If all
-                sequences have produced a new stop token, generation
-                will stop.
+            inputs: dict. Must contain ``token_ids`` and
+                ``padding_mask``; optionally ``audio_features``,
+                ``audio_indices``, ``pixel_values``, ``image_grid_thw``,
+                ``vision_indices`` for multimodal prompts.
+            stop_token_ids: sequence of int or None. Token IDs that
+                terminate generation.
+
+        Returns:
+            Dict with ``token_ids`` (generated sequence) and
+            ``padding_mask`` (True for valid positions, False after
+            the first emitted stop token).
         """
         token_ids, padding_mask = inputs["token_ids"], inputs["padding_mask"]
-        audio_features = inputs.get("audio_features", None)
-        pixel_values = inputs.get("pixel_values", None)
-        grid_thw = inputs.get("grid_thw", None)
-        # Create and seed cache with a single forward pass.
         hidden_states, cache = self._build_cache(
             token_ids,
-            audio_features=audio_features,
-            pixel_values=pixel_values,
-            grid_thw=grid_thw,
+            audio_features=inputs.get("audio_features"),
+            audio_indices=inputs.get("audio_indices"),
+            pixel_values=inputs.get("pixel_values"),
+            image_grid_thw=inputs.get("image_grid_thw"),
+            vision_indices=inputs.get("vision_indices"),
+            padding_mask=padding_mask,
         )
-        # Compute the lengths of all user inputted tokens ids.
-        row_lengths = ops.sum(ops.cast(padding_mask, "int32"), axis=-1)
-        # Start at the first index that has no user inputted id.
-        index = ops.min(row_lengths)
+        index = ops.min(ops.sum(ops.cast(padding_mask, "int32"), axis=-1))
 
         def next(prompt, cache, index):
-            # The cache index is the index of our previous token.
             cache_update_index = index - 1
             batch_size = ops.shape(prompt)[0]
             prompt = ops.slice(prompt, [0, cache_update_index], [batch_size, 1])
             logits, hidden_states, cache = self.call_with_cache(
-                prompt,
-                cache,
-                cache_update_index,
+                prompt, cache, cache_update_index
             )
             return (
                 ops.squeeze(logits, axis=1),
@@ -336,26 +731,23 @@ class Qwen3OmniCausalLM(CausalLM):
             model=self,
         )
 
-        # Compute an output padding mask with the token ids we updated.
         if stop_token_ids is not None:
-            # Build a mask of stop token locations not in the original
-            # prompt (not in locations where `padding_mask` is True).
-            end_locations = any_equal(
-                token_ids, stop_token_ids, ops.logical_not(padding_mask)
+            # Mask everything after the first newly-emitted stop token.
+            end_locations = ops.cast(
+                any_equal(
+                    token_ids,
+                    stop_token_ids,
+                    ops.logical_not(padding_mask),
+                ),
+                "int32",
             )
-            end_locations = ops.cast(end_locations, "int32")
-            # Use cumsum to get ones in all locations after end_locations.
             cumsum = ops.cast(ops.cumsum(end_locations, axis=-1), "int32")
-            overflow = cumsum - end_locations
-            # Our padding mask is the inverse of these overflow locations.
-            padding_mask = ops.logical_not(ops.cast(overflow, "bool"))
+            padding_mask = ops.logical_not(
+                ops.cast(cumsum - end_locations, "bool")
+            )
         else:
-            # Without early stopping, all locations will have been updated.
             padding_mask = ops.ones_like(token_ids, dtype="bool")
-        return {
-            "token_ids": token_ids,
-            "padding_mask": padding_mask,
-        }
+        return {"token_ids": token_ids, "padding_mask": padding_mask}
 
     def score(
         self,
@@ -364,46 +756,106 @@ class Qwen3OmniCausalLM(CausalLM):
         scoring_mode="logits",
         layer_intercept_fn=None,
         target_ids=None,
+        audio_features=None,
+        audio_indices=None,
+        pixel_values=None,
+        image_grid_thw=None,
+        vision_indices=None,
     ):
-        if scoring_mode not in ("logits", "loss"):
-            raise ValueError(
-                "Unsupported scoring_mode. Must be one of 'logits' or 'loss'."
-            )
+        """Score token sequences, with optional multimodal injection.
 
+        Mirrors the embedding path used by ``call_with_cache`` so
+        multimodal prompts are scored against the real fused
+        representation rather than a text-only fallback.
+
+        Args:
+            token_ids: int tensor. ``(batch, seq)`` tokens to score.
+            padding_mask: bool tensor or None. ``(batch, seq)``;
+                defaults to all ones.
+            scoring_mode: ``"logits"`` or ``"loss"``.
+            layer_intercept_fn: callable or None. ``fn(x, layer_idx)``
+                invoked after each decoder layer (``layer_idx=-1`` is
+                the post-embedding hidden state).
+            target_ids: int tensor or None. Required when
+                ``scoring_mode='loss'``; the ground-truth tokens used
+                for per-position cross-entropy.
+            audio_features, audio_indices, pixel_values,
+            image_grid_thw, vision_indices: see ``call_with_cache``.
+
+        Returns:
+            ``(batch, seq, vocab)`` logits when ``scoring_mode='logits'``,
+            or ``(batch, seq)`` per-token cross-entropy when
+            ``scoring_mode='loss'``.
+        """
+        if scoring_mode not in ("logits", "loss"):
+            raise ValueError("scoring_mode must be 'logits' or 'loss'.")
         if scoring_mode == "loss" and target_ids is None:
-            raise ValueError(
-                "Cannot compute loss without targets. Please provide target "
-                "token ids via the target_ids parameter."
-            )
+            raise ValueError("target_ids is required for scoring_mode='loss'.")
 
         batch_shape = ops.shape(token_ids)[:2]
         assert len(batch_shape) == 2
-
         if padding_mask is None:
             padding_mask = ops.ones(shape=batch_shape)
-
         if layer_intercept_fn is None:
+            layer_intercept_fn = lambda x, _i: x  # noqa: E731
 
-            def default_layer_intercept_fn(x, unused_i):
-                return x
+        if audio_features is not None or pixel_values is not None:
+            x, deepstack_features, visual_pos_mask = (
+                self._compute_initial_embeddings(
+                    token_ids,
+                    audio_features=audio_features,
+                    audio_indices=audio_indices,
+                    pixel_values=pixel_values,
+                    image_grid_thw=image_grid_thw,
+                    vision_indices=vision_indices,
+                )
+            )
+        else:
+            x = self.backbone.token_embedding(token_ids)
+            deepstack_features = visual_pos_mask = None
+        x = layer_intercept_fn(x, -1)
 
-            layer_intercept_fn = default_layer_intercept_fn
-
-        token_embeddings = self.backbone.token_embedding(token_ids)
-        x = layer_intercept_fn(token_embeddings, -1)
+        batch_size = ops.shape(token_ids)[0]
+        seq_len = ops.shape(token_ids)[1]
+        image_token_id = self._get_token_id("image_token_id")
+        if image_grid_thw is not None and image_token_id is not None:
+            pos_np, _ = self.compute_multimodal_rope_index(
+                ops.convert_to_numpy(token_ids),
+                image_grid_thw=ops.convert_to_numpy(image_grid_thw),
+                attention_mask=ops.convert_to_numpy(padding_mask),
+            )
+            position_ids = ops.convert_to_tensor(
+                pos_np.astype("int32"), dtype="int32"
+            )
+        else:
+            positions = ops.repeat(
+                ops.expand_dims(ops.arange(seq_len, dtype="int32"), 0),
+                batch_size,
+                axis=0,
+            )
+            position_ids = ops.stack([positions] * 3, axis=0)
 
         for i, transformer_layer in enumerate(self.backbone.transformer_layers):
-            x = transformer_layer(x, decoder_padding_mask=padding_mask)
+            x = transformer_layer(
+                x,
+                position_ids=position_ids,
+                decoder_padding_mask=padding_mask,
+            )
+            if (
+                deepstack_features is not None
+                and visual_pos_mask is not None
+                and i < len(deepstack_features)
+            ):
+                x = self.backbone._deepstack_process(
+                    x, visual_pos_mask, deepstack_features[i]
+                )
             x = layer_intercept_fn(x, i)
 
-        x = self.backbone.layer_norm(x)
-        logits = self.backbone.token_embedding(x, reverse=True)
-
+        logits = self.backbone.token_embedding(
+            self.backbone.layer_norm(x), reverse=True
+        )
         if scoring_mode == "logits":
             return logits
-
-        per_token_loss_fn = keras.losses.SparseCategoricalCrossentropy(
+        return keras.losses.SparseCategoricalCrossentropy(
             from_logits=True, reduction="none"
-        )
-        per_token_loss = per_token_loss_fn(target_ids, logits)
-        return per_token_loss
+        )(target_ids, logits)

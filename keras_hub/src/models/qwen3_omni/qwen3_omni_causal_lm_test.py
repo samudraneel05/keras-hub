@@ -1,5 +1,6 @@
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 from keras import ops
 
@@ -21,8 +22,18 @@ from keras_hub.src.tests.test_case import TestCase
 class Qwen3OmniCausalLMTest(TestCase):
     def setUp(self):
         self.vocab = ["!", "air", "Ġair", "plane", "Ġat", "port"]
-        self.vocab += ["<|endoftext|>"]
-        self.vocab += ["<|im_end|>"]
+        self.vocab += [
+            "<|im_end|>",
+            "<|endoftext|>",
+            "<|im_start|>",
+            "<|vision_start|>",
+            "<|vision_end|>",
+            "<|image_pad|>",
+            "<|video_pad|>",
+            "<|audio_start|>",
+            "<|audio_end|>",
+            "<|audio_pad|>",
+        ]
         self.vocab = dict([(token, i) for i, token in enumerate(self.vocab)])
         self.merges = ["Ġ a", "Ġ t", "Ġ i", "Ġ b", "a i", "p l", "n e"]
         self.merges += ["Ġa t", "p o", "r t", "Ġt h", "ai r", "pl a", "po rt"]
@@ -56,7 +67,11 @@ class Qwen3OmniCausalLMTest(TestCase):
             cls=Qwen3OmniCausalLM,
             init_kwargs=self.init_kwargs,
             train_data=self.train_data,
-            expected_output_shape=(2, 7, 8),
+            expected_output_shape=(
+                2,
+                7,
+                self.preprocessor.tokenizer.vocabulary_size(),
+            ),
         )
 
     def test_generate(self):
@@ -123,6 +138,114 @@ class Qwen3OmniCausalLMTest(TestCase):
             init_kwargs=self.init_kwargs,
             input_data=self.input_data,
         )
+
+    def test_mrope_audio_branch(self):
+        """Audio tokens advance all three channels in lock-step."""
+        causal_lm = Qwen3OmniCausalLM(**self.init_kwargs)
+        audio_token = 97
+        audio_start = 96
+        audio_end = 98
+        # <pad><audio_start><audio_pad><audio_pad><audio_end><pad>
+        token_ids = np.array(
+            [[1, audio_start, audio_token, audio_token, audio_end, 2]],
+            dtype=np.int64,
+        )
+        # _get_feat_extract_output_length(3) -> 2
+        position_ids, deltas = causal_lm.compute_multimodal_rope_index(
+            token_ids,
+            audio_seqlens=np.array([3], dtype=np.int64),
+            audio_token_id=audio_token,
+            audio_start_token_id=audio_start,
+        )
+        self.assertEqual(position_ids.shape, (3, 1, 6))
+        # All three channels match for the audio segment.
+        self.assertAllEqual(position_ids[0, 0], position_ids[1, 0])
+        self.assertAllEqual(position_ids[1, 0], position_ids[2, 0])
+
+    def test_mrope_video_branch(self):
+        """Video positions scale temporally with second_per_grids."""
+        causal_lm = Qwen3OmniCausalLM(**self.init_kwargs)
+        vision_start = 90
+        vision_end = 91
+        video_token = 93
+        # <pad><vision_start><video><video><video><video><vision_end><pad>
+        token_ids = np.array(
+            [
+                [
+                    1,
+                    vision_start,
+                    video_token,
+                    video_token,
+                    video_token,
+                    video_token,
+                    vision_end,
+                    2,
+                ]
+            ],
+            dtype=np.int64,
+        )
+        # grid (T=1, H=4, W=4) => llm_h=llm_w=2 => 1*2*2 = 4 video tokens.
+        video_grid_thw = np.array([[1, 4, 4]], dtype=np.int64)
+        second_per_grids = np.array([1.0], dtype=np.float64)
+        position_ids, _ = causal_lm.compute_multimodal_rope_index(
+            token_ids,
+            video_grid_thw=video_grid_thw,
+            second_per_grids=second_per_grids,
+            vision_start_token_id=vision_start,
+            video_token_id=video_token,
+        )
+        self.assertEqual(position_ids.shape, (3, 1, 8))
+        # Width channel should vary across the 4 video slots.
+        vid_w = position_ids[2, 0, 2:6]
+        self.assertGreater(int(vid_w.max() - vid_w.min()), 0)
+
+    def test_mrope_audio_in_video_branch(self):
+        """Audio-in-video merges audio and video positions in order."""
+        causal_lm = Qwen3OmniCausalLM(**self.init_kwargs)
+        vision_start = 90
+        audio_start = 96
+        audio_token = 97
+        video_token = 93
+        vision_end = 91
+        audio_end = 98
+        # <vision_start><audio_start><audio><audio><video><video>
+        # <video><video><audio_end><vision_end>
+        token_ids = np.array(
+            [
+                [
+                    vision_start,
+                    audio_start,
+                    audio_token,
+                    audio_token,
+                    video_token,
+                    video_token,
+                    video_token,
+                    video_token,
+                    audio_end,
+                    vision_end,
+                ]
+            ],
+            dtype=np.int64,
+        )
+        video_grid_thw = np.array([[1, 4, 4]], dtype=np.int64)
+        second_per_grids = np.array([1.0], dtype=np.float64)
+        audio_seqlens = np.array([3], dtype=np.int64)
+        position_ids, _ = causal_lm.compute_multimodal_rope_index(
+            token_ids,
+            video_grid_thw=video_grid_thw,
+            second_per_grids=second_per_grids,
+            audio_seqlens=audio_seqlens,
+            use_audio_in_video=True,
+            vision_start_token_id=vision_start,
+            audio_start_token_id=audio_start,
+            audio_token_id=audio_token,
+            video_token_id=video_token,
+        )
+        self.assertEqual(position_ids.shape, (3, 1, 10))
+        # Position IDs must be monotonically non-decreasing on the
+        # temporal channel across the merged block.
+        t_channel = position_ids[0, 0]
+        self.assertTrue(bool(np.all(t_channel[1:] >= t_channel[:-1])))
 
     @pytest.mark.extra_large
     def test_all_presets(self):
