@@ -361,17 +361,62 @@ class Qwen3OmniCausalLMPreprocessor(CausalLMPreprocessor):
         image_pixel_values,
         image_grid_thw,
         vision_indices,
+        backbone=None,
     ):
-        if audio_features is not None:
-            output["audio_features"] = audio_features
-        if audio_indices is not None:
-            output["audio_indices"] = audio_indices
-        if image_pixel_values is not None:
-            output["pixel_values"] = image_pixel_values
-        if image_grid_thw is not None:
-            output["image_grid_thw"] = image_grid_thw
-        if vision_indices is not None:
-            output["vision_indices"] = vision_indices
+        """Write all multimodal keys into ``output``.
+
+        Present modalities receive their real tensors; absent modalities
+        receive zero-length placeholder tensors with the correct dtype
+        so Keras input-spec validation passes cleanly.
+        """
+        # Resolve encoder attributes for static placeholder shapes.
+        ve = getattr(backbone, "vision_encoder", None) if backbone else None
+        ae = getattr(backbone, "audio_encoder", None) if backbone else None
+        has_vision = (
+            getattr(backbone, "has_vision", False) if backbone else False
+        ) or image_pixel_values is not None
+        has_audio = (
+            getattr(backbone, "has_audio", False) if backbone else False
+        ) or audio_features is not None
+
+        if has_vision:
+            if image_pixel_values is not None:
+                output["pixel_values"] = image_pixel_values
+            elif ve is not None:
+                output["pixel_values"] = np.zeros(
+                    (
+                        0,
+                        0,
+                        ve.temporal_patch_size,
+                        ve.patch_size,
+                        ve.patch_size,
+                        ve.in_channels,
+                    ),
+                    dtype="float32",
+                )
+            output["image_grid_thw"] = (
+                image_grid_thw
+                if image_grid_thw is not None
+                else np.zeros((0, 0, 3), dtype="int32")
+            )
+            output["vision_indices"] = (
+                vision_indices
+                if vision_indices is not None
+                else np.zeros((0, 0), dtype="int32")
+            )
+
+        if has_audio:
+            if audio_features is not None:
+                output["audio_features"] = audio_features
+            elif ae is not None:
+                output["audio_features"] = np.zeros(
+                    (0, 0, ae.num_mel_bins), dtype="float32"
+                )
+            output["audio_indices"] = (
+                audio_indices
+                if audio_indices is not None
+                else np.zeros((0, 0), dtype="int32")
+            )
 
     @preprocessing_function
     def call(
@@ -478,6 +523,7 @@ class Qwen3OmniCausalLMPreprocessor(CausalLMPreprocessor):
             image_pixel_values,
             image_grid_thw,
             vision_indices,
+            backbone=getattr(self, "backbone", None),
         )
         return keras.utils.pack_x_y_sample_weight(x, y, sample_weight)
 
@@ -544,5 +590,6 @@ class Qwen3OmniCausalLMPreprocessor(CausalLMPreprocessor):
             image_pixel_values,
             image_grid_thw,
             vision_indices,
+            backbone=getattr(self, "backbone", None),
         )
         return result

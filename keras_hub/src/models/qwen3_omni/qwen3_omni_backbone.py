@@ -326,11 +326,7 @@ class Qwen3OmniBackbone(Backbone):
         self.position_id_per_seconds = position_id_per_seconds
 
     def _fill_missing_multimodal_inputs(self, inputs):
-        """Inject zero-sized defaults for any missing multimodal keys.
-
-        Lets a text-only forward Just Work through a multimodal backbone
-        for both ``__call__`` (runtime) and ``compute_output_spec``.
-        """
+        """Lets a text-only forward work through a multimodal backbone."""
         if not (isinstance(inputs, dict) and self.is_multimodal):
             return inputs
         # Normalise every value to a tensor before injecting defaults to
@@ -352,10 +348,12 @@ class Qwen3OmniBackbone(Backbone):
                 ),
             )
             inputs.setdefault(
-                "image_grid_thw", ops.zeros((0, 0, 3), dtype="int32")
+                "image_grid_thw",
+                ops.zeros((0, 0, 3), dtype="int32"),
             )
             inputs.setdefault(
-                "vision_indices", ops.zeros((0, 0), dtype="int32")
+                "vision_indices",
+                ops.zeros((0, 0), dtype="int32"),
             )
         if self.has_audio:
             ae = self.audio_encoder
@@ -363,16 +361,15 @@ class Qwen3OmniBackbone(Backbone):
                 "audio_features",
                 ops.zeros((0, 0, ae.num_mel_bins)),
             )
-            inputs.setdefault("audio_indices", ops.zeros((0, 0), dtype="int32"))
+            inputs.setdefault(
+                "audio_indices",
+                ops.zeros((0, 0), dtype="int32"),
+            )
         return inputs
 
     def __call__(self, inputs, *args, **kwargs):
         inputs = self._fill_missing_multimodal_inputs(inputs)
         return super().__call__(inputs, *args, **kwargs)
-
-    def compute_output_spec(self, inputs, *args, **kwargs):
-        inputs = self._fill_missing_multimodal_inputs(inputs)
-        return super().compute_output_spec(inputs, *args, **kwargs)
 
     def get_config(self):
         config = super().get_config()

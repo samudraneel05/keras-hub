@@ -263,6 +263,8 @@ class Qwen3OmniAudioEncoder(keras.layers.Layer):
                 dtype=self.compute_dtype,
             )
 
+        input_features = ops.cast(input_features, self.compute_dtype)
+
         # Apply convolutional downsampling
         # Input: (batch, time, mel_bins) -> (batch, time, mel_bins, 1)
         hidden_states = ops.expand_dims(input_features, axis=-1)

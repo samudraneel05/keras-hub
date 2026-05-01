@@ -751,7 +751,7 @@ class Qwen3OmniVisionEncoder(keras.layers.Layer):
 
         # Build (row, col) position indices for all tokens
         pos_ids_list = []
-        for idx in range(ops.shape(grid_thw)[0]):
+        for idx in range(int(ops.convert_to_numpy(ops.shape(grid_thw)[0]))):
             t = ops.cast(grid_thw[idx, 0], "int32")
             h = ops.cast(grid_thw[idx, 1], "int32")
             w = ops.cast(grid_thw[idx, 2], "int32")
@@ -830,7 +830,7 @@ class Qwen3OmniVisionEncoder(keras.layers.Layer):
         pos_embed_weight = self.pos_embed.embeddings
 
         patch_pos_embeds_list = []
-        for i in range(ops.shape(grid_thw)[0]):
+        for i in range(int(ops.convert_to_numpy(ops.shape(grid_thw)[0]))):
             t = ops.cast(grid_ts[i], "int32")
             h = ops.cast(grid_hs[i], "int32")
             w = ops.cast(grid_ws[i], "int32")
@@ -937,6 +937,7 @@ class Qwen3OmniVisionEncoder(keras.layers.Layer):
         """
         pixel_values = inputs["pixel_values"]
         grid_thw = inputs["grid_thw"]
+        pixel_values = ops.cast(pixel_values, self.compute_dtype)
 
         # Accept both unbatched ``(N, t, p, p, c)`` and batched
         # ``(batch, N, t, p, p, c)`` pixel_values (the latter is what the
@@ -988,6 +989,7 @@ class Qwen3OmniVisionEncoder(keras.layers.Layer):
         # Add interpolated position embeddings
         pos_embeds = self._fast_pos_embed_interpolate(grid_thw)
         pos_embeds = ops.expand_dims(pos_embeds, axis=0)
+        pos_embeds = ops.cast(pos_embeds, hidden_states.dtype)
         hidden_states = hidden_states + pos_embeds
 
         # Compute rotary position embeddings

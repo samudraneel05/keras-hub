@@ -184,6 +184,23 @@ def _pixel_values_hf_to_keras(pixel_values_np, vision_encoder):
     return patches[np.newaxis]
 
 
+def _audio_features_hf_to_keras(input_features_np, audio_encoder):
+    if input_features_np.ndim != 3:
+        raise ValueError(
+            "`input_features` must be rank 3; received "
+            f"shape {input_features_np.shape}."
+        )
+    if input_features_np.shape[-1] == audio_encoder.num_mel_bins:
+        return input_features_np
+    if input_features_np.shape[1] == audio_encoder.num_mel_bins:
+        return np.transpose(input_features_np, (0, 2, 1))
+    raise ValueError(
+        "`input_features` must have `num_mel_bins` on axis 1 or axis 2; "
+        f"received shape {input_features_np.shape} for "
+        f"num_mel_bins={audio_encoder.num_mel_bins}."
+    )
+
+
 def _logit_tolerance(dtype_str):
     """Loose atol for bfloat16, tight for float32."""
     return 5e-2 if dtype_str == "bfloat16" else 1e-3
@@ -248,32 +265,6 @@ def _inspect_keras_dtypes(keras_model):
     for dt, n in dtype_counts.most_common():
         print(f"     {dt:>10}: {n:>14,} params")
     print(f"   [DTYPE] total weight bytes: {total_bytes / (1024**3):.2f} GB")
-
-
-def _force_cast_model_to(keras_model, torch_dtype):
-    """Manually cast every Keras variable's underlying torch tensor.
-
-    Keras's ``from_preset(dtype=...)`` sets the model's compute dtype policy
-    but does not always materialize the underlying weights in that dtype —
-    the variables can end up as fp32 Parameters even when bf16 was asked
-    for. This helper walks every variable and calls ``.data.to(torch_dtype)``
-    in place so the memory actually shrinks.
-    """
-    n_cast = 0
-    for var in keras_model.variables:
-        t = getattr(var, "value", var)
-        if not hasattr(t, "dtype"):
-            continue
-        if t.dtype != torch_dtype:
-            # In-place replace the underlying storage with a cast copy.
-            # We use .data.set_() to avoid creating a new Parameter object
-            # that would detach it from the Keras graph.
-            new_t = t.data.to(torch_dtype)
-            t.data = new_t
-            n_cast += 1
-    if n_cast:
-        print(f"   [CAST] Force-cast {n_cast} variables to {torch_dtype}.")
-    return n_cast
 
 
 # ---------------------------------------------------------------
@@ -622,6 +613,71 @@ def test_parameter_count(keras_backbone, hf_param_count):
         )
 
 
+def _make_complete_backbone_inputs(
+    backbone,
+    token_ids,
+    padding_mask,
+    *,
+    pixel_values=None,
+    image_grid_thw=None,
+    vision_indices=None,
+    audio_features=None,
+    audio_indices=None,
+):
+    """Build a fully-bound backbone input dict.
+
+    The backbone's Functional graph requires every declared input key to
+    be present.  The *preprocessor* owns this responsibility in the
+    normal call path; here the conversion script does it directly.
+
+    Absent modalities receive zero-length placeholder tensors so Keras
+    input-spec validation is satisfied without special backbone hooks.
+    """
+    inputs = {
+        "token_ids": token_ids,
+        "padding_mask": padding_mask,
+    }
+    if backbone.has_vision:
+        ve = backbone.vision_encoder
+        inputs["pixel_values"] = (
+            pixel_values
+            if pixel_values is not None
+            else ops.zeros(
+                (
+                    0,
+                    0,
+                    ve.temporal_patch_size,
+                    ve.patch_size,
+                    ve.patch_size,
+                    ve.in_channels,
+                )
+            )
+        )
+        inputs["image_grid_thw"] = (
+            image_grid_thw
+            if image_grid_thw is not None
+            else ops.zeros((0, 0, 3), dtype="int32")
+        )
+        inputs["vision_indices"] = (
+            vision_indices
+            if vision_indices is not None
+            else ops.zeros((0, 0), dtype="int32")
+        )
+    if backbone.has_audio:
+        ae = backbone.audio_encoder
+        inputs["audio_features"] = (
+            audio_features
+            if audio_features is not None
+            else ops.zeros((0, 0, ae.num_mel_bins))
+        )
+        inputs["audio_indices"] = (
+            audio_indices
+            if audio_indices is not None
+            else ops.zeros((0, 0), dtype="int32")
+        )
+    return inputs
+
+
 def validate_text_output(keras_model, cache_dir, dtype_str):
     print("\n" + "=" * 50)
     print("TEXT-ONLY VALIDATION")
@@ -647,9 +703,10 @@ def validate_text_output(keras_model, cache_dir, dtype_str):
     token_ids = ops.convert_to_tensor(hf_ids.astype(np.int32))
     padding_mask = ops.ones_like(token_ids)
     with torch.inference_mode():
-        keras_hidden = keras_model.backbone(
-            {"token_ids": token_ids, "padding_mask": padding_mask}
+        backbone_inputs = _make_complete_backbone_inputs(
+            keras_model.backbone, token_ids, padding_mask
         )
+        keras_hidden = keras_model.backbone(backbone_inputs)
         keras_logits = keras_model.backbone.token_embedding(
             keras_hidden, reverse=True
         )
@@ -691,28 +748,43 @@ def validate_image_output(keras_model, cache_dir, dtype_str):
     token_ids = ops.convert_to_tensor(arrays["input_ids"])
     padding_mask = ops.convert_to_tensor(arrays["attention_mask"])
     pixel_values_np = _pixel_values_hf_to_keras(arrays["pixel_values"], ve)
-    pixel_values = ops.cast(ops.convert_to_tensor(pixel_values_np), dtype_str)
+    pixel_values = ops.convert_to_tensor(pixel_values_np)
     grid_thw = ops.convert_to_tensor(arrays["grid_thw"][np.newaxis])
     hf_logits = arrays["logits"]
     print(f"\n  KerasHub pixel_values shape: {pixel_values_np.shape}")
     del pixel_values_np
+
     _log_rss("image: before backbone forward")
 
+    # Derive vision_indices: positions of image pad tokens.
+    image_token_id = (
+        keras_model.preprocessor.tokenizer.image_token_id
+        if keras_model.preprocessor is not None
+        else None
+    )
+    vis_idx = (
+        np.where(arrays["input_ids"][0] == image_token_id)[0].astype(np.int32)
+        if image_token_id is not None
+        else np.array([], dtype=np.int32)
+    )
+    vision_indices = ops.convert_to_tensor(vis_idx[np.newaxis])  # (1, N_vis)
+
     with torch.inference_mode():
-        keras_hidden = backbone(
-            {
-                "token_ids": token_ids,
-                "padding_mask": padding_mask,
-                "pixel_values": pixel_values,
-                "image_grid_thw": grid_thw,
-            }
+        backbone_inputs = _make_complete_backbone_inputs(
+            backbone,
+            token_ids,
+            padding_mask,
+            pixel_values=pixel_values,
+            image_grid_thw=grid_thw,
+            vision_indices=vision_indices,
         )
+        keras_hidden = backbone(backbone_inputs)
         _log_rss("image: after backbone forward")
         keras_logits = backbone.token_embedding(keras_hidden, reverse=True)
         _log_rss("image: after logit projection")
         keras_logits = ops.convert_to_numpy(keras_logits).astype(np.float32)
-    del keras_hidden, token_ids, padding_mask, pixel_values, grid_thw
-    _log_rss("image: after tensor cleanup")
+    del keras_hidden, token_ids, padding_mask
+    del pixel_values, grid_thw, vision_indices
 
     _print_logit_diff(
         keras_logits, hf_logits, "Image", _logit_tolerance(dtype_str)
@@ -751,28 +823,44 @@ def validate_audio_output(keras_model, cache_dir, dtype_str):
     print("AUDIO VALIDATION")
     print("=" * 50)
 
+    backbone = keras_model.backbone
+    ae = backbone.audio_encoder
     arrays, meta = _load_arrays(cache_dir, "audio")
     token_ids = ops.convert_to_tensor(arrays["input_ids"])
     padding_mask = ops.convert_to_tensor(arrays["attention_mask"])
-    audio_features = ops.cast(
-        ops.convert_to_tensor(arrays["input_features"]), dtype_str
+    audio_features_np = _audio_features_hf_to_keras(
+        arrays["input_features"], ae
     )
+    audio_features = ops.convert_to_tensor(audio_features_np)
     hf_logits = arrays["logits"]
-    print(f"\n  audio_features shape: {arrays['input_features'].shape}")
+    print(f"\n  KerasHub audio_features shape: {audio_features_np.shape}")
+    del audio_features_np
+
+    # Derive audio_indices: positions of audio pad tokens.
+    audio_token_id = (
+        keras_model.preprocessor.tokenizer.audio_token_id
+        if keras_model.preprocessor is not None
+        else None
+    )
+    aud_idx = (
+        np.where(arrays["input_ids"][0] == audio_token_id)[0].astype(np.int32)
+        if audio_token_id is not None
+        else np.array([], dtype=np.int32)
+    )
+    audio_indices = ops.convert_to_tensor(aud_idx[np.newaxis])  # (1, N_aud)
 
     with torch.inference_mode():
-        keras_hidden = keras_model.backbone(
-            {
-                "token_ids": token_ids,
-                "padding_mask": padding_mask,
-                "audio_features": audio_features,
-            }
+        backbone_inputs = _make_complete_backbone_inputs(
+            backbone,
+            token_ids,
+            padding_mask,
+            audio_features=audio_features,
+            audio_indices=audio_indices,
         )
-        keras_logits = keras_model.backbone.token_embedding(
-            keras_hidden, reverse=True
-        )
+        keras_hidden = backbone(backbone_inputs)
+        keras_logits = backbone.token_embedding(keras_hidden, reverse=True)
         keras_logits = ops.convert_to_numpy(keras_logits).astype(np.float32)
-    del keras_hidden, token_ids, padding_mask, audio_features
+    del keras_hidden, token_ids, padding_mask, audio_features, audio_indices
 
     _print_logit_diff(
         keras_logits, hf_logits, "Audio", _logit_tolerance(dtype_str)
@@ -824,24 +912,43 @@ def validate_video_output(keras_model, cache_dir, dtype_str):
     token_ids = ops.convert_to_tensor(arrays["input_ids"])
     padding_mask = ops.convert_to_tensor(arrays["attention_mask"])
     pixel_values_np = _pixel_values_hf_to_keras(arrays["pixel_values"], ve)
-    pixel_values = ops.cast(ops.convert_to_tensor(pixel_values_np), dtype_str)
+    pixel_values = ops.convert_to_tensor(pixel_values_np)
     grid_thw = ops.convert_to_tensor(arrays["grid_thw"][np.newaxis])
     hf_logits = arrays["logits"]
     print(f"\n  KerasHub video pixel_values shape: {pixel_values_np.shape}")
     del pixel_values_np
 
+    # Derive vision_indices: positions of video pad tokens.
+    video_token_id = (
+        keras_model.preprocessor.tokenizer.video_token_id
+        if keras_model.preprocessor is not None
+        else None
+    ) or (
+        getattr(keras_model.preprocessor.tokenizer, "image_token_id", None)
+        if keras_model.preprocessor is not None
+        else None
+    )
+    vis_idx = (
+        np.where(arrays["input_ids"][0] == video_token_id)[0].astype(np.int32)
+        if video_token_id is not None
+        else np.array([], dtype=np.int32)
+    )
+    vision_indices = ops.convert_to_tensor(vis_idx[np.newaxis])  # (1, N_vis)
+
     with torch.inference_mode():
-        keras_hidden = backbone(
-            {
-                "token_ids": token_ids,
-                "padding_mask": padding_mask,
-                "pixel_values": pixel_values,
-                "image_grid_thw": grid_thw,
-            }
+        backbone_inputs = _make_complete_backbone_inputs(
+            backbone,
+            token_ids,
+            padding_mask,
+            pixel_values=pixel_values,
+            image_grid_thw=grid_thw,
+            vision_indices=vision_indices,
         )
+        keras_hidden = backbone(backbone_inputs)
         keras_logits = backbone.token_embedding(keras_hidden, reverse=True)
         keras_logits = ops.convert_to_numpy(keras_logits).astype(np.float32)
-    del keras_hidden, token_ids, padding_mask, pixel_values, grid_thw
+    del keras_hidden, token_ids, padding_mask
+    del pixel_values, grid_thw, vision_indices
 
     _print_logit_diff(
         keras_logits, hf_logits, "Video", _logit_tolerance(dtype_str)
@@ -963,16 +1070,6 @@ def main(_):
         _freeze_keras_model(keras_model)
         _log_rss("after Keras load")
         _inspect_keras_dtypes(keras_model)
-
-        # If the user asked for bf16 but from_preset left weights in fp32
-        # (e.g. because the preset's dtype policy only sets compute_dtype),
-        # force-cast them now. Otherwise the "60 GB bf16 model" is silently
-        # a "120 GB fp32 model" and activations OOM us on image validation.
-        if dtype_str != "float32":
-            _force_cast_model_to(keras_model, torch_dtype)
-            _free()
-            _log_rss("after force cast")
-            _inspect_keras_dtypes(keras_model)
 
         _free()
         print("   KerasHub model loaded (autograd disabled, params frozen)!")
