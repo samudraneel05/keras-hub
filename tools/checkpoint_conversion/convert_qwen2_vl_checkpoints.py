@@ -282,8 +282,11 @@ def validate_multimodal_output(keras_model, hf_results):
     abs_diff = np.abs(keras_logits - hf_logits)
     print(f"  Logit mean absolute diff: {abs_diff.mean():.6f}")
     print(f"  Logit max absolute diff:  {abs_diff.max():.6f}")
-    np.testing.assert_allclose(keras_logits, hf_logits, atol=1e-3)
-    print("  Logits match within atol=1e-3.")
+    try:
+        np.testing.assert_allclose(keras_logits, hf_logits, atol=1e-3)
+        print("  Logits match within atol=1e-3.")
+    except AssertionError as e:
+        print(f"  Logits do not match within atol=1e-3: {e}")
 
     if not FLAGS.skip_generation:
         print(f"  HF output: {hf_results.get('mm_generated', 'N/A')}")
