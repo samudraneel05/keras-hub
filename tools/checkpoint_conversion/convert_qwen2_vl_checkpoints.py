@@ -128,11 +128,18 @@ def precompute_hf_outputs(hf_model, hf_tokenizer, hf_preset):
     n_image_tokens = int(grid_thw.prod().item()) // merge_len
     prompt = MULTIMODAL_PROMPT.replace(pad, pad * n_image_tokens)
     enc = hf_tokenizer(prompt, return_tensors="pt")
+    # transformers>=5.x requires mm_token_type_ids for M-RoPE: 0 for text,
+    # 1 for image tokens (what the processor returns alongside input_ids).
+    image_pad_id = hf_tokenizer.convert_tokens_to_ids(pad)
+    mm_token_type_ids = np.where(enc["input_ids"].numpy() == image_pad_id, 1, 0)
     hf_inputs = {
         "input_ids": enc["input_ids"].to(device),
         "attention_mask": enc["attention_mask"].to(device),
         "pixel_values": vision["pixel_values"].to(device),
         "image_grid_thw": vision["image_grid_thw"].to(device),
+        "mm_token_type_ids": torch.tensor(
+            mm_token_type_ids, dtype=torch.long
+        ).to(device),
     }
     with torch.no_grad():
         hf_out = hf_model(**hf_inputs)
