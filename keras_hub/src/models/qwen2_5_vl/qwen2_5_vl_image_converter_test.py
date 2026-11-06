@@ -3,9 +3,7 @@ import numpy as np
 from keras_hub.src.models.qwen2_5_vl.qwen2_5_vl_image_converter import (
     Qwen2_5VLImageConverter,
 )
-from keras_hub.src.models.qwen2_5_vl.qwen2_5_vl_image_converter import (
-    smart_resize,
-)
+from keras_hub.src.models.qwen2_vl.qwen2_vl_image_converter import smart_resize
 from keras_hub.src.tests.test_case import TestCase
 
 

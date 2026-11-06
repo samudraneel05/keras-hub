@@ -63,7 +63,7 @@ class Qwen2_5VLMultimodalBackboneTest(TestCase):
             out_dim=128,
             depth=2,
             num_heads=4,
-            mlp_ratio=4,
+            intermediate_dim=256,
             spatial_merge_size=2,
         )
         self.init_kwargs = {

@@ -3,10 +3,10 @@ import numpy as np
 from keras import ops
 
 from keras_hub.src.models.qwen2_5_vl.qwen2_5_vl_vision_encoder import (
-    Qwen2_5VLVisionAttention,
-)
-from keras_hub.src.models.qwen2_5_vl.qwen2_5_vl_vision_encoder import (
     Qwen2_5VLVisionEncoder,
+)
+from keras_hub.src.models.qwen2_vl.qwen2_vl_vision_encoder import (
+    Qwen2VLVisionAttention,
 )
 from keras_hub.src.tests.test_case import TestCase
 from keras_hub.src.utils.keras_utils import running_on_gpu
@@ -22,7 +22,7 @@ class Qwen2_5VLVisionEncoderTest(TestCase):
             "out_dim": 128,
             "depth": 2,
             "num_heads": 4,
-            "mlp_ratio": 4,
+            "intermediate_dim": 256,
             "spatial_merge_size": 2,
         }
 
@@ -62,13 +62,13 @@ class Qwen2_5VLVisionEncoderTest(TestCase):
             tol = 2e-3 if running_on_gpu() else 1e-4
             np.testing.assert_allclose(
                 output[0, :6],
-                [-0.723, -0.3895, 0.116, -0.4222, 0.5193, -0.5394],
+                [0.0041, 1.0065, -0.5704, -0.6975, -0.5812, 0.5544],
                 atol=tol,
                 rtol=tol,
             )
             np.testing.assert_allclose(
                 output[1, :4],
-                [-0.7028, -0.0419, 0.1543, -0.2447],
+                [0.4611, 0.7877, -0.7716, -1.0729],
                 atol=tol,
                 rtol=tol,
             )
@@ -88,9 +88,13 @@ class Qwen2_5VLVisionEncoderTest(TestCase):
         self.assertEqual(encoder.out_dim, new_encoder.out_dim)
         self.assertEqual(encoder.depth, new_encoder.depth)
         self.assertEqual(encoder.num_heads, new_encoder.num_heads)
-        self.assertEqual(encoder.mlp_ratio, new_encoder.mlp_ratio)
+        self.assertEqual(encoder.intermediate_dim, new_encoder.intermediate_dim)
         self.assertEqual(
             encoder.spatial_merge_size, new_encoder.spatial_merge_size
+        )
+        self.assertEqual(encoder.window_size, new_encoder.window_size)
+        self.assertEqual(
+            encoder.fullatt_block_indexes, new_encoder.fullatt_block_indexes
         )
 
     def test_vision_encoder_with_multiple_images(self):
@@ -145,9 +149,7 @@ class Qwen2_5VLVisionEncoderTest(TestCase):
         # Two segments, so the mask is exercised across chunk boundaries.
         seg = np.repeat([0, 1], [600, seq_len - 600]).astype("int32")
 
-        attn = Qwen2_5VLVisionAttention(
-            embed_dim=embed_dim, num_heads=num_heads
-        )
+        attn = Qwen2VLVisionAttention(embed_dim=embed_dim, num_heads=num_heads)
         # Identity RoPE (cos=1, sin=0) keeps the reference simple.
         cos = np.ones((seq_len, head_dim), dtype="float32")
         sin = np.zeros((seq_len, head_dim), dtype="float32")
@@ -198,3 +200,87 @@ class Qwen2_5VLVisionEncoderTest(TestCase):
 
         self.assertEqual(tuple(cos.shape), (4, 16))
         self.assertEqual(tuple(sin.shape), (4, 16))
+
+    def test_window_layout_matches_hf(self):
+        """`_window_layout` reproduces HF `get_vision_window_index`.
+
+        Grid [1, 8, 10]: merge grid 4x5, window = 4 merge units per side
+        → two windows: 4x4 block (16 units) + trailing column (4 units).
+        """
+        encoder = Qwen2_5VLVisionEncoder(**self.init_kwargs)
+        window_index, unit_window = encoder._window_layout(
+            np.array([[1, 8, 10]], dtype="int32"), num_units=20
+        )
+        self.assertAllEqual(
+            window_index,
+            [
+                0,
+                1,
+                2,
+                3,
+                5,
+                6,
+                7,
+                8,
+                10,
+                11,
+                12,
+                13,
+                15,
+                16,
+                17,
+                18,
+                4,
+                9,
+                14,
+                19,
+            ],
+        )
+        self.assertAllEqual(
+            unit_window,
+            [0] * 4 + [1] + [0] * 4 + [1] + [0] * 4 + [1] + [0] * 4 + [1],
+        )
+
+    def test_window_unpermute_roundtrip(self):
+        """argsort(window_index) restores the original merge-unit order."""
+        encoder = Qwen2_5VLVisionEncoder(**self.init_kwargs)
+        window_index, _ = encoder._window_layout(
+            np.array([[1, 8, 10], [2, 6, 8]], dtype="int32"), num_units=32
+        )
+        units = ops.arange(32, dtype="int32")
+        permuted = ops.take(units, window_index, axis=0)
+        restored = ops.take(permuted, ops.argsort(window_index), axis=0)
+        self.assertAllEqual(restored, units)
+
+    def test_window_vs_full_attention(self):
+        """Windowed and full-attention blocks produce different segment
+        masks on multi-window grids, and identical masks when the image
+        fits in a single window.
+
+        Grid [1, 8, 16]: merge grid 4x8, window 4x4 → 2 windows per frame.
+        With every block in `fullatt_block_indexes`, tokens attend across
+        the whole frame; windowed blocks restrict to their window.
+        """
+        rng = np.random.default_rng(0)
+        kw = dict(self.init_kwargs, depth=1)
+        patches = rng.random((64, kw["temporal_patch_size"], 14, 14, 3)).astype(
+            "float32"
+        )
+
+        grid_two_windows = np.array([[1, 8, 16]], dtype="int32")
+        windowed = Qwen2_5VLVisionEncoder(**dict(kw, fullatt_block_indexes=[]))
+        full = Qwen2_5VLVisionEncoder(**dict(kw, fullatt_block_indexes=[0]))
+        # Same weights → differences come only from the attention mask.
+        windowed(patches, grid_two_windows)
+        full(patches, grid_two_windows)
+        full.set_weights(windowed.get_weights())
+        out_w = ops.convert_to_numpy(windowed(patches, grid_two_windows))
+        out_f = ops.convert_to_numpy(full(patches, grid_two_windows))
+        self.assertGreater(float(np.max(np.abs(out_w - out_f))), 1e-3)
+
+        # Single-window grid: both segment choices are the same mask.
+        grid_one_window = np.array([[1, 8, 8]], dtype="int32")
+        out_w = ops.convert_to_numpy(windowed(patches[:32], grid_one_window))
+        out_f = ops.convert_to_numpy(full(patches[:32], grid_one_window))
+        tol = 2e-3 if running_on_gpu() else 1e-5
+        np.testing.assert_allclose(out_w, out_f, atol=tol, rtol=tol)

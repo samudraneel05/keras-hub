@@ -117,7 +117,7 @@ class Qwen2_5VLCausalLMTest(TestCase):
                 out_dim=8,
                 depth=2,
                 num_heads=2,
-                mlp_ratio=4,
+                intermediate_dim=256,
                 spatial_merge_size=1,
             ),
         )
@@ -162,7 +162,7 @@ class Qwen2_5VLCausalLMTest(TestCase):
                 out_dim=8,
                 depth=2,
                 num_heads=2,
-                mlp_ratio=4,
+                intermediate_dim=256,
                 spatial_merge_size=1,
             ),
         )

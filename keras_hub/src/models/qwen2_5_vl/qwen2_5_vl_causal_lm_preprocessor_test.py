@@ -236,14 +236,86 @@ class Qwen2_5VLCausalLMPreprocessorTest(TestCase):
             list(ops.convert_to_numpy(out["image_grid_thw"])[0]), [4, 2, 2]
         )
 
-        # Temporal channel increments per merged frame (4 tokens each).
+        # Temporal channel steps by `tokens_per_second` per merged frame
+        # (4 tokens each) — HF's default when no fps metadata is given.
         pos_ids = ops.convert_to_numpy(out["position_ids"])
         self.assertEqual(
             list(pos_ids[0, 1:17]),
-            [1] * 4 + [2] * 4 + [3] * 4 + [4] * 4,
+            [1] * 4 + [5] * 4 + [9] * 4 + [13] * 4,
         )
         self.assertEqual(list(pos_ids[:, 17]), [3, 3, 3])
         self.assertEqual(list(pos_ids[:, 18]), [4, 4, 4])
+
+    def test_generate_preprocess_second_per_grid_ts(self):
+        """`second_per_grid_ts` scales video temporal positions.
+
+        interval = tokens_per_second * sgt; fractional intervals truncate
+        per frame (HF `(arange(t) * interval).long()`).
+        """
+        image_converter = self._image_converter()
+        preprocessor = Qwen2_5VLCausalLMPreprocessor(
+            tokenizer=self.tokenizer,
+            image_converter=image_converter,
+            sequence_length=32,
+        )
+
+        video = np.ones((8, 2, 2, 3), dtype="float32")
+        tok = self.tokenizer
+        prompt = (
+            tok.vision_start_token
+            + tok.video_token
+            + tok.vision_end_token
+            + " air"
+        )
+
+        # sgt = 0.5 → interval = 4 * 0.5 = 2: positions step by 2.
+        out = preprocessor.generate_preprocess(
+            {
+                "prompts": prompt,
+                "videos": [video],
+                "second_per_grid_ts": [0.5],
+            }
+        )
+        pos_ids = ops.convert_to_numpy(out["position_ids"])
+        self.assertEqual(
+            list(pos_ids[0, 1:17]),
+            [1] * 4 + [3] * 4 + [5] * 4 + [7] * 4,
+        )
+
+        # sgt = 2/3 → interval = 8/3 ≈ 2.67: per-frame truncation gives
+        # steps 0, 2, 5, 8.
+        out = preprocessor.generate_preprocess(
+            {
+                "prompts": prompt,
+                "videos": [video],
+                "second_per_grid_ts": [2.0 / 3.0],
+            }
+        )
+        pos_ids = ops.convert_to_numpy(out["position_ids"])
+        self.assertEqual(
+            list(pos_ids[0, 1:17]),
+            [1] * 4 + [3] * 4 + [6] * 4 + [9] * 4,
+        )
+
+        # Custom tokens_per_second scales the interval.
+        preprocessor = Qwen2_5VLCausalLMPreprocessor(
+            tokenizer=self.tokenizer,
+            image_converter=image_converter,
+            tokens_per_second=2,
+            sequence_length=32,
+        )
+        out = preprocessor.generate_preprocess(
+            {
+                "prompts": prompt,
+                "videos": [video],
+                "second_per_grid_ts": [1.0],
+            }
+        )
+        pos_ids = ops.convert_to_numpy(out["position_ids"])
+        self.assertEqual(
+            list(pos_ids[0, 1:17]),
+            [1] * 4 + [3] * 4 + [5] * 4 + [7] * 4,
+        )
 
     def test_batched_call_with_images(self):
         """Two prompts with two images: each row expands its own span."""
