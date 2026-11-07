@@ -346,6 +346,14 @@ class Qwen2_5VLVisionEncoder(Qwen2VLVisionEncoder):
             )
             grid_thw = ops.reshape(grid_thw, (-1, 3))
 
+        # Text-only calls feed a zero-sized pixel_values tensor. When the
+        # patch count is statically zero, skip the transformer entirely.
+        if pixel_values.shape[0] == 0:
+            merged = ops.zeros((0, self.out_dim), dtype="float32")
+            if batched:
+                merged = ops.expand_dims(merged, axis=0)
+            return merged
+
         # `ops.cond` can't express a 0-vs-N patch branch under `jax.jit`
         # (branches must return equal shapes). Instead, always encode by
         # appending one dummy merge group and gathering the real tokens

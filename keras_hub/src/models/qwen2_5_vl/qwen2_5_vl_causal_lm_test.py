@@ -131,6 +131,7 @@ class Qwen2_5VLCausalLMTest(TestCase):
             max_length=16,
         )
         self.assertTrue(isinstance(output, str))
+        self.assertIn(" air", output)
 
     def test_fit_with_image(self):
         """fit() trains through the multimodal preprocessor path."""

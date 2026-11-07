@@ -1,4 +1,3 @@
-import keras
 import numpy as np
 from keras import ops
 
@@ -40,13 +39,21 @@ class Qwen2_5VLVisionEncoderTest(TestCase):
         ).astype("float32")
 
     def test_vision_encoder_basics(self):
-        keras.utils.set_random_seed(42)
         encoder = Qwen2_5VLVisionEncoder(**self.init_kwargs)
 
         # 1 image with t=2, h=2, w=2 → total_patches = 8
         grid_thw = np.array([[2, 2, 2]], dtype="int32")
         total_patches = int(np.prod(grid_thw))
         hidden_states = self._patches(total_patches)
+
+        encoder(hidden_states, grid_thw)  # build
+        # Deterministic weights so the value checks below run on every
+        # backend. QwenLayerNorm uses a `1.0 + scale` gain, so zero-centered
+        # noise keeps all norms ~identity.
+        rng = np.random.default_rng(0)
+        for w in encoder.weights:
+            values = rng.normal(0.0, 0.05, size=w.shape)
+            w.assign(values.astype("float32"))
 
         output = encoder(hidden_states, grid_thw)
 
@@ -58,20 +65,21 @@ class Qwen2_5VLVisionEncoderTest(TestCase):
         )
 
         output = ops.convert_to_numpy(output)
-        if keras.backend.backend() == "tensorflow":
-            tol = 2e-3 if running_on_gpu() else 1e-4
-            np.testing.assert_allclose(
-                output[0, :6],
-                [0.0041, 1.0065, -0.5704, -0.6975, -0.5812, 0.5544],
-                atol=tol,
-                rtol=tol,
-            )
-            np.testing.assert_allclose(
-                output[1, :4],
-                [0.4611, 0.7877, -0.7716, -1.0729],
-                atol=tol,
-                rtol=tol,
-            )
+        # fp32 runs as tf32 on gpu and drifts to ~1e-3 over the full
+        # encoder; keep 2x headroom over observed diffs to avoid flakes.
+        tol = 2e-3 if running_on_gpu() else 1e-4
+        np.testing.assert_allclose(
+            output[0, :6],
+            [-0.010924, -0.028941, -0.076252, -0.052837, -0.00358, 0.05001],
+            atol=tol,
+            rtol=tol,
+        )
+        np.testing.assert_allclose(
+            output[1, :4],
+            [-0.02005, -0.021227, -0.074488, -0.03363],
+            atol=tol,
+            rtol=tol,
+        )
 
     def test_vision_encoder_config_roundtrip(self):
         encoder = Qwen2_5VLVisionEncoder(**self.init_kwargs)
